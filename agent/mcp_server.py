@@ -44,6 +44,40 @@ AGENT_DIR = Path(__file__).resolve().parent
 if str(AGENT_DIR) not in sys.path:
     sys.path.insert(0, str(AGENT_DIR))
 
+
+def _load_runtime_env() -> None:
+    """Load TUSHARE_TOKEN (and other runtime vars) from a project-local .env.
+
+    The MCP server is spawned as a child process by the Hermes gateway
+    (see ``mcp_servers.vibe-trading`` in ``~/.hermes/config.yaml``). The
+    child inherits the parent env, but ``mcp_servers.*.env`` only
+    forwards an explicit allowlist — TUSHARE_TOKEN is not in that
+    allowlist, so the child sees an empty TUSHARE_TOKEN and the tushare
+    loader's ``is_available()`` returns False. This forces the
+    fallback chain to mootdx → akshare, which is broken in mainland
+    China (East Money throttled). The result: ``get_market_data``
+    returns noisy cache fragments, not live A-share prices.
+
+    We work around the missing allowlist entry by loading the project
+    ``.env`` directly here. ``override=False`` keeps any explicit
+    gateway-forwarded variable (so this never silently overwrites a
+    real secret) and the loader is a no-op when python-dotenv is not
+    installed (e.g. minimal dev venv).
+
+    6.3 Hermes runtime patch — load
+    ``/home/alfred/.vibe-trading/.env`` if present.
+    """
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except ImportError:
+        return
+    project_env = Path("/home/alfred/.vibe-trading/.env")
+    if project_env.exists():
+        load_dotenv(project_env, override=False)
+
+
+_load_runtime_env()
+
 from fastmcp import Context, FastMCP
 
 mcp = FastMCP("Vibe-Trading")

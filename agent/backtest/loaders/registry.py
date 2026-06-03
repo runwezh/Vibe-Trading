@@ -68,14 +68,15 @@ def _ensure_registered() -> None:
 # ---------------------------------------------------------------------------
 
 FALLBACK_CHAINS: dict[str, list[str]] = {
+    # 6.2 Hermes patch: akshare East Money scraper throttled in mainland China, moved to last
     "a_share":   ["tushare", "mootdx", "akshare"],
     "us_equity": ["yfinance", "akshare"],
     "hk_equity": ["yfinance", "futu", "akshare"],
     "crypto":    ["okx", "ccxt"],
     "futures":   ["tushare", "akshare"],
     "fund":      ["tushare", "akshare"],
-    "macro":     ["akshare", "tushare"],
-    "forex":     ["akshare", "yfinance"],
+    "macro":     ["tushare", "akshare"],  # was: akshare first
+    "forex":     ["yfinance", "akshare"],  # was: akshare first
 }
 
 

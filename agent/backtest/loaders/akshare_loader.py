@@ -80,11 +80,27 @@ class DataLoader:
     requires_auth = False
 
     def is_available(self) -> bool:
-        """Available if akshare is installed."""
+        """Available if akshare is installed AND East Money is reachable.
+
+        6.2 Hermes patch: in mainland China, East Money scraper is throttled
+        and akshare network calls fail. Probe eastmoney.com once at startup;
+        if unreachable, report unavailable so the fallback chain skips to mootdx/tushare.
+        """
         try:
             import akshare  # noqa: F401
-            return True
         except ImportError:
+            return False
+        # Probe East Money connectivity (akshare's primary data source)
+        try:
+            import socket
+            socket.setdefaulttimeout(2.0)
+            socket.create_connection(("push2.eastmoney.com", 443), timeout=2.0).close()
+            return True
+        except (OSError, socket.timeout):
+            logger.warning(
+                "akshare: East Money unreachable (mainland China scraper throttled). "
+                "Falling back to tushare/mootdx."
+            )
             return False
 
     def __init__(self) -> None:

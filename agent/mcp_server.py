@@ -6,9 +6,27 @@ Zero API key required for HK/US/crypto research markets (yfinance, OKX,
 AKShare are free). Trading connector tools are profile-scoped and require the
 selected connector's own local app or OAuth setup.
 
+Surfaces 54 tools: skills, research goals, backtest/factor/options/pattern
+analysis, market data, fundamentals & capital-flow & news & discovery
+(get_fund_flow / get_dragon_tiger / get_northbound_flow / get_margin_trading /
+get_block_trades / get_shareholder_count / get_lockup_expiry / get_sector_info /
+get_research_reports / get_stock_news / get_sec_filings /
+get_financial_statements / get_options_chain / get_stock_profile /
+screen_market / search_symbol / get_macro_series / iwencai_search), read-only
+trading-connector reads, swarm orchestration, trade-journal and shadow-account
+analysis. Every exposed tool is read-only or research-only; no order-placing or
+order-cancelling tool is ever surfaced via MCP.
+
 Usage:
     python mcp_server.py                    # stdio transport (default)
-    python mcp_server.py --transport sse    # SSE transport for web clients
+    python mcp_server.py --transport sse    # legacy SSE transport (GET /sse + POST /messages/)
+    python mcp_server.py --transport http   # Streamable HTTP transport (single POST/GET /mcp endpoint)
+
+The ``http`` (Streamable HTTP) transport is the current MCP spec default
+(2025-03-26+). Modern clients (e.g. QwenPaw, and clients that negotiate by
+POSTing an InitializeRequest) require it; the legacy ``sse`` transport is
+deprecated. The single endpoint is served at ``/mcp``, so point HTTP clients
+at ``http://<host>:<port>/mcp`` (NOT ``/sse``, which is a legacy-SSE artifact).
 
 OpenClaw config (~/.openclaw/config.yaml):
     skills:
@@ -32,9 +50,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
-import os
-import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -80,8 +95,16 @@ def _load_runtime_env() -> None:
 _load_runtime_env()
 
 from fastmcp import Context, FastMCP
+from cli._version import __version__ as APP_VERSION
+from src.market_data import (
+    DEFAULT_MAX_ROWS,
+    cap_rows,
+    detect_source,
+    fetch_market_data_json,
+    get_loader,
+)
 
-mcp = FastMCP("Vibe-Trading")
+mcp = FastMCP("Vibe-Trading", version=APP_VERSION)
 
 logger = logging.getLogger(__name__)
 
@@ -93,12 +116,229 @@ logger = logging.getLogger(__name__)
 _skills_loader = None
 _registry = None
 _goal_store = None
-_include_shell_tools = True
+# Fail-closed default: the bash / background_run shell tools are a remote
+# code-execution surface once the MCP server is reachable by any client (stdio,
+# SSE, or Streamable HTTP), so they stay OFF unless an operator explicitly opts
+# in. main() may flip this on via --enable-shell-tools or the
+# VIBE_TRADING_ENABLE_SHELL_TOOLS env var. Keeping the module-level default off
+# means an ASGI/import deployment that never calls main() also stays safe.
+_include_shell_tools = False
 
 
 def _env_shell_tools_enabled() -> bool:
-    """Return whether shell tools were explicitly enabled for network MCP."""
-    return os.getenv("VIBE_TRADING_ENABLE_SHELL_TOOLS", "").strip().lower() in {"1", "true", "yes", "on"}
+    """Return whether shell tools were explicitly enabled via the environment."""
+    from src.config.accessor import get_env_config
+
+    return get_env_config().api.vibe_trading_enable_shell_tools
+
+
+def _resolve_include_shell_tools(cli_opt_in: bool) -> bool:
+    """Resolve whether the MCP server should register shell tools.
+
+    Shell tools (``bash`` / ``background_run``) run arbitrary OS commands and are
+    an RCE surface regardless of transport. They are therefore disabled for every
+    transport unless the operator explicitly opts in. Transport type never
+    implicitly grants shell access: previously ``stdio`` force-enabled these tools
+    with no opt-out (GHSA-6wjh-cc6v-xfrx), which also widened the reachable
+    surface of the ``bash`` OS-command-injection issue (GHSA-m768-22r9-h4x7).
+
+    Args:
+        cli_opt_in: Whether ``--enable-shell-tools`` was passed on the command line.
+
+    Returns:
+        True only when the operator opted in via the flag or the
+        ``VIBE_TRADING_ENABLE_SHELL_TOOLS`` environment variable.
+    """
+    return bool(cli_opt_in) or _env_shell_tools_enabled()
+
+
+# ---------------------------------------------------------------------------
+# Network-transport DNS-rebinding hardening (GHSA-p3c9)
+#
+# The stdio transport is a private parent/child pipe and needs no host guard.
+# The network transports (``--transport sse`` / ``http``) bind a TCP port, so
+# a page in the user's browser could POST to the local MCP endpoint via
+# DNS-rebinding and reach every MCP tool. fastmcp ships NO host/origin
+# protection, so we wrap the ASGI app with a Host allow-list
+# (_HostGuardMiddleware) plus an Origin allow-list before the MCP session is
+# reached. Default = loopback-only, so a local HTTP/SSE MCP still works.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_MCP_ALLOWED_HOSTS = ("127.0.0.1", "::1", "localhost")
+
+
+def _normalize_host(host: str) -> str:
+    """Normalize a Host header value (or allow-list entry) for comparison.
+
+    Strips the port and any IPv6 brackets, then lowercases: ``[::1]:8900``
+    becomes ``::1``, ``Example.COM:8900`` becomes ``example.com``. A value
+    with more than one colon and no brackets is treated as a bare IPv6
+    literal and kept whole (never split into a fake ``host:port`` pair).
+
+    Args:
+        host: Raw Host header value or allow-list entry.
+
+    Returns:
+        The comparable hostname, lowercased.
+    """
+    value = host.strip()
+    if value.startswith("["):
+        # Bracketed IPv6 literal, optionally followed by ``:port``.
+        end = value.find("]")
+        if end != -1:
+            return value[1:end].lower()
+    elif value.count(":") == 1:
+        # ``name:port`` — bare IPv6 (multiple colons) is kept whole.
+        value = value.rsplit(":", 1)[0]
+    return value.lower()
+
+
+def _parse_allowed_hosts(raw: str | None) -> list[str]:
+    """Parse ``VIBE_TRADING_MCP_ALLOWED_HOSTS`` into a Host/Origin allow-list.
+
+    Entries are normalized like Host header values (case-insensitive, IPv6
+    brackets stripped); wildcard forms (``*``, ``*.``) pass through apart
+    from lowercasing.
+
+    Args:
+        raw: Comma-separated env value (may be ``None`` / empty).
+
+    Returns:
+        The parsed host list, or the loopback-only default
+        (``127.0.0.1``, ``::1``, ``localhost``) when unset/blank so a local
+        HTTP/SSE MCP keeps working while DNS-rebinding hosts are rejected.
+    """
+    hosts = []
+    for entry in (raw or "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        hosts.append(entry.lower() if entry.startswith("*") else _normalize_host(entry))
+    return hosts or list(_DEFAULT_MCP_ALLOWED_HOSTS)
+
+
+def _host_matches(host: str, pattern: str) -> bool:
+    """Return whether ``host`` matches an allow-list ``pattern``.
+
+    Mirrors Starlette's TrustedHostMiddleware semantics: ``*`` allows any host
+    and a leading ``*.`` matches the bare domain plus any subdomain.
+    """
+    if pattern == "*":
+        return True
+    if pattern.startswith("*."):
+        return host == pattern[2:] or host.endswith(pattern[1:])
+    return host == pattern
+
+
+def _origin_allowed(origin: str | None, allowed_hosts: list[str]) -> bool:
+    """Return whether a request ``Origin`` header is trusted.
+
+    A missing/blank Origin is allowed: non-browser MCP clients (curl, the
+    Python SDK) never send one, and DNS-rebinding is a browser-only attack. A
+    present Origin is trusted only when its hostname matches the allow-list.
+
+    Args:
+        origin: The raw ``Origin`` header value, or ``None`` when absent.
+        allowed_hosts: Trusted hostnames (same list used for Host validation).
+    """
+    if not origin:
+        return True
+    from urllib.parse import urlparse
+
+    host = urlparse(origin).hostname
+    if not host:
+        return False
+    return any(_host_matches(host, pattern) for pattern in allowed_hosts)
+
+
+class _HostGuardMiddleware:
+    """ASGI middleware rejecting requests with an untrusted Host header.
+
+    Same role as Starlette's TrustedHostMiddleware, but normalizes the
+    header first: Starlette's plain ``split(":")`` mangles bracketed IPv6
+    (``[::1]:8900`` → ``"["``) and matches case-sensitively, which locked
+    out ``--host ::1`` deployments and ``LOCALHOST`` clients entirely.
+    """
+
+    def __init__(self, app: Any, allowed_hosts: list[str]) -> None:
+        self.app = app
+        self.allowed_hosts = list(allowed_hosts)
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") == "http":
+            host: str | None = None
+            for key, value in scope.get("headers", []):
+                if key == b"host":
+                    host = value.decode("latin-1")
+                    break
+            normalized = _normalize_host(host) if host else ""
+            if not any(_host_matches(normalized, pattern) for pattern in self.allowed_hosts):
+                from starlette.responses import PlainTextResponse
+
+                await PlainTextResponse("Invalid host header", status_code=400)(
+                    scope, receive, send
+                )
+                return
+        await self.app(scope, receive, send)
+
+
+class _OriginGuardMiddleware:
+    """ASGI middleware rejecting untrusted cross-origin browser requests.
+
+    Complements TrustedHostMiddleware: it blocks a request whose ``Origin``
+    header names a host outside the allow-list before the MCP session handler
+    runs, returning ``403`` so a rebinding page cannot invoke MCP tools.
+    """
+
+    def __init__(self, app: Any, allowed_hosts: list[str]) -> None:
+        self.app = app
+        self.allowed_hosts = list(allowed_hosts)
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") == "http":
+            origin: str | None = None
+            for key, value in scope.get("headers", []):
+                if key == b"origin":
+                    origin = value.decode("latin-1")
+                    break
+            if not _origin_allowed(origin, self.allowed_hosts):
+                from starlette.responses import PlainTextResponse
+
+                await PlainTextResponse("Origin not allowed", status_code=403)(
+                    scope, receive, send
+                )
+                return
+        await self.app(scope, receive, send)
+
+
+def _security_middleware(allowed_hosts: list[str]) -> list[Any]:
+    """Build the Host + Origin allow-list middleware for network MCP transports.
+
+    Args:
+        allowed_hosts: Trusted hostnames from ``_parse_allowed_hosts``.
+
+    Returns:
+        A middleware list suitable for ``FastMCP.http_app(middleware=...)``.
+    """
+    from starlette.middleware import Middleware
+
+    return [
+        Middleware(_HostGuardMiddleware, allowed_hosts=allowed_hosts),
+        Middleware(_OriginGuardMiddleware, allowed_hosts=allowed_hosts),
+    ]
+
+
+def _build_network_app(transport: str, allowed_hosts: list[str]):
+    """Build a DNS-rebinding-hardened FastMCP ASGI app for a network transport.
+
+    Args:
+        transport: ``"sse"`` or ``"streamable-http"``.
+        allowed_hosts: Trusted Host/Origin hostnames.
+
+    Returns:
+        A Starlette ASGI app (with MCP lifespan) ready for ``uvicorn.run``.
+    """
+    return mcp.http_app(transport=transport, middleware=_security_middleware(allowed_hosts))
 
 
 def _get_skills_loader():
@@ -476,39 +716,30 @@ def backtest(run_dir: str) -> str:
 
 @mcp.tool
 def factor_analysis(
-    codes: list[str],
-    factor_name: str,
-    start_date: str,
-    end_date: str,
-    source: str = "auto",
-    top_n: int = 10,
-    bottom_n: int = 10,
+    factor_csv: str,
+    return_csv: str,
+    output_dir: str,
+    n_groups: int = 5,
 ) -> str:
-    """Compute factor IC/IR analysis and layered backtest for a cross-section of stocks.
+    """Compute factor IC/IR analysis and layered backtest from prepared CSVs.
 
     Analyzes factor predictive power using Spearman rank IC, IR (IC/std),
-    and top/bottom quintile return spreads.
+    and quantile group return spreads.
 
     Args:
-        codes: List of stock codes (e.g. ["000001.SZ", "600519.SH"]).
-        factor_name: Factor column name in daily_basic data (e.g. "pe_ttm", "pb", "turnover_rate").
-        start_date: Start date (YYYY-MM-DD).
-        end_date: End date (YYYY-MM-DD).
-        source: Data source ("tushare", "yfinance", "auto").
-        top_n: Number of top-ranked stocks per period.
-        bottom_n: Number of bottom-ranked stocks per period.
+        factor_csv: Path to factor values CSV (index=date, columns=codes).
+        return_csv: Path to returns CSV (same structure as factor_csv).
+        output_dir: Directory for output files (ic_series.csv, ic_summary.json, group_equity.csv).
+        n_groups: Number of quantile groups (default 5).
     """
     registry = _get_registry()
     return registry.execute(
         "factor_analysis",
         {
-            "codes": codes,
-            "factor_name": factor_name,
-            "start_date": start_date,
-            "end_date": end_date,
-            "source": source,
-            "top_n": top_n,
-            "bottom_n": bottom_n,
+            "factor_csv": factor_csv,
+            "return_csv": return_csv,
+            "output_dir": output_dir,
+            "n_groups": n_groups,
         },
     )
 
@@ -1029,29 +1260,13 @@ async def run_swarm(
 # Market data tool
 # ---------------------------------------------------------------------------
 
-DEFAULT_MAX_ROWS = 250
-
-_SOURCE_PATTERNS = [
-    (re.compile(r"^\d{6}\.(SZ|SH|BJ)$", re.I), "tushare"),
-    (re.compile(r"^[A-Z]+\.US$", re.I), "yfinance"),
-    (re.compile(r"^\d{3,5}\.HK$", re.I), "yfinance"),
-    (re.compile(r"^[A-Z]+-USDT$", re.I), "okx"),
-    (re.compile(r"^[A-Z]+/USDT$", re.I), "ccxt"),
-]
-
-
 def _detect_source(code: str) -> str:
-    for pattern, source in _SOURCE_PATTERNS:
-        if pattern.match(code):
-            return source
-    return "tushare"
+    return detect_source(code)
 
 
 def _get_loader(source: str):
     """Get loader class via registry with fallback support."""
-    from backtest.loaders.registry import get_loader_cls_with_fallback
-
-    return get_loader_cls_with_fallback(source)
+    return get_loader(source)
 
 
 def _cap_rows(records: list, max_rows: int) -> list | dict[str, object]:
@@ -1065,23 +1280,7 @@ def _cap_rows(records: list, max_rows: int) -> list | dict[str, object]:
     cap are returned unchanged (plain list) — small queries are
     byte-identical.
     """
-    n = len(records)
-    if max_rows < 0:
-        max_rows = DEFAULT_MAX_ROWS  # negative invalid -> enforce cap, never unbounded
-    if max_rows == 0 or n <= max_rows:
-        return records
-    step = math.ceil(n / max_rows)
-    sampled = records[::step]
-    if sampled[-1] is not records[-1]:
-        sampled = sampled + [records[-1]]
-    return {
-        "rows": n,
-        "returned": len(sampled),
-        "truncated": True,
-        "policy": f"every-{step}th-row (even stride; last bar pinned)",
-        "hint": "narrow the date range, coarsen interval, or set max_rows=0 for all rows",
-        "data": sampled,
-    }
+    return cap_rows(records, max_rows)
 
 
 @mcp.tool
@@ -1099,15 +1298,18 @@ def get_market_data(
     - "yfinance": HK/US equities (free, e.g. AAPL.US, 700.HK)
     - "okx": cryptocurrency (free, e.g. BTC-USDT, ETH-USDT)
     - "tushare": China A-shares (requires TUSHARE_TOKEN, e.g. 000001.SZ)
+    - "baostock": China A-shares via TCP protocol, bypasses HTTP CDN blocks (e.g. 000001.SZ, 601595.SH)
+    - "tencent": China A-shares via Tencent Finance API (e.g. 000001.SZ, 601595.SH)
     - "akshare": A-shares, US, HK, futures, forex (free, e.g. 000001.SZ, AAPL.US)
     - "ccxt": crypto from 100+ exchanges (free, e.g. BTC/USDT)
+    - "mt5": forex/metals from a local MetaTrader 5 terminal (Windows; e.g. EUR/USD, XAUUSD.FX)
     - "auto": auto-detect based on symbol format (with fallback)
 
     Args:
         codes: List of symbols (e.g. ["AAPL.US", "BTC-USDT", "000001.SZ"]).
         start_date: Start date (YYYY-MM-DD).
         end_date: End date (YYYY-MM-DD).
-        source: Data source ("auto", "yfinance", "okx", "tushare", "akshare", "ccxt").
+        source: Data source ("auto", "yfinance", "okx", "tushare", "baostock", "tencent", "akshare", "ccxt").
         interval: Bar size (1m/5m/15m/30m/1H/4H/1D, default "1D").
         max_rows: Per-symbol row cap (default 250) so the response stays
             within the MCP token budget. A symbol exceeding it returns an
@@ -1115,47 +1317,436 @@ def get_market_data(
             plus truncation metadata. Set max_rows=0 for all rows
             (unbounded, legacy behavior).
     """
-    results = {}
+    return fetch_market_data_json(
+        codes=codes,
+        start_date=start_date,
+        end_date=end_date,
+        source=source,
+        interval=interval,
+        max_rows=max_rows,
+        loader_resolver=_get_loader,
+    )
 
-    if source == "auto":
-        groups: dict[str, list[str]] = {}
-        for code in codes:
-            src = _detect_source(code)
-            groups.setdefault(src, []).append(code)
-    else:
-        groups = {source: list(codes)}
 
-    for src, src_codes in groups.items():
-        loader_cls = _get_loader(src)
-        loader = loader_cls()
-        try:
-            data_map = loader.fetch(src_codes, start_date, end_date, interval=interval)
-        except Exception:
-            # A loader blow-up for one group must not lose already-resolved
-            # symbols or surface as an opaque MCP error; those codes fall
-            # through to _unresolved below (P05).
-            logger.exception("market-data loader %r failed for %s; codes fall through to _unresolved", src, src_codes)
-            data_map = {}
-        for symbol, df in data_map.items():
-            records = df.reset_index().to_dict(orient="records")
-            for r in records:
-                for k, v in r.items():
-                    if hasattr(v, "isoformat"):
-                        r[k] = v.isoformat()
-                    elif hasattr(v, "item"):
-                        r[k] = v.item()
-            results[symbol] = _cap_rows(records, max_rows)
+# ---------------------------------------------------------------------------
+# Read-only fundamentals, flow, news & discovery tools
+#
+# Each wrapper delegates to the auto-discovered local registry, exactly like
+# factor_analysis / pattern_recognition above. The registry returns a clean
+# JSON error envelope when a key-gated tool (get_macro_series needs
+# FRED_API_KEY, iwencai_search needs VIBE_TRADING_IWENCAI_KEY) is absent — see
+# ``_execute_key_gated`` below, which honours that contract even though the
+# tool is excluded from the registry by ``check_available()``. Every tool below
+# is strictly read-only data — no order/trading tool is ever surfaced via MCP.
+# ---------------------------------------------------------------------------
 
-    # P05: a typo / wrong-suffix / delisted / no-data symbol used to vanish
-    # silently (the dict only held winners), indistinguishable from "no data".
-    # Surface every requested code that produced nothing under a reserved key.
-    # Additive: omitted entirely when all codes resolved, so the happy-path
-    # payload is byte-identical to before.
-    unresolved = [c for c in codes if c not in results]
-    if unresolved:
-        results["_unresolved"] = unresolved
 
-    return json.dumps(results, ensure_ascii=False, indent=2)
+# Map of key-gated MCP tools to their concrete tool class. When the required
+# API key is unset the class' ``check_available()`` returns False, so the tool
+# is excluded from the auto-discovered registry and ``registry.execute`` would
+# answer with a generic "Tool not found". That contradicts the documented
+# contract above (a clean, env-var-named error). For these tools we therefore
+# fall through to the tool's own ``execute()`` — whose missing-key envelope
+# names the exact env var (``FRED_API_KEY`` / ``VIBE_TRADING_IWENCAI_KEY``).
+def _key_gated_tool_classes() -> dict[str, Any]:
+    """Return the {tool_name: tool_class} map for key-gated MCP tools.
+
+    Imported lazily so a missing optional dependency in either module degrades
+    to the registry path rather than breaking module import.
+
+    Returns:
+        Mapping of MCP tool name to its ``BaseTool`` subclass.
+    """
+    from src.tools.fred_macro_tool import FredMacroTool
+    from src.tools.iwencai_tool import IWenCaiSearchTool
+
+    return {
+        "get_macro_series": FredMacroTool,
+        "iwencai_search": IWenCaiSearchTool,
+    }
+
+
+def _execute_key_gated(name: str, params: dict[str, Any]) -> str:
+    """Run a key-gated read-only tool, preserving its env-var-named error.
+
+    Prefers the auto-discovered registry (present when the API key is set). When
+    the key is absent the tool is excluded from the registry, so we invoke its
+    concrete ``execute()`` directly to surface the documented missing-key error
+    that names the exact env var — never a generic "Tool not found".
+
+    Args:
+        name: MCP tool name (``get_macro_series`` or ``iwencai_search``).
+        params: Keyword arguments forwarded to the tool.
+
+    Returns:
+        The tool's JSON envelope as a string.
+    """
+    registry = _get_registry()
+    if registry.get(name) is not None:
+        return registry.execute(name, params)
+    tool_cls = _key_gated_tool_classes().get(name)
+    if tool_cls is None:
+        return registry.execute(name, params)
+    return tool_cls().execute(**params)
+
+
+@mcp.tool
+def get_fund_flow(codes: list[str], period: str = "daily", days: int = 30) -> str:
+    """Fetch order-bucket net capital inflow (main/super-large/large/medium/small).
+
+    Markets: A-share (.SH/.SZ/.BJ), Hong Kong (.HK) and US (.US). Use this to
+    gauge whether large/main-force money is flowing in or out, as daily history
+    or the current session's per-minute line. One unresolvable symbol is
+    reported per-symbol and does not abort the batch.
+
+    Args:
+        codes: Symbols with market suffix, e.g. ["600519.SH", "00700.HK"].
+        period: "daily" (daily net-inflow history) or "min" (per-minute line).
+        days: For period="daily", number of most-recent daily bars to keep.
+    """
+    registry = _get_registry()
+    return registry.execute("get_fund_flow", {"codes": codes, "period": period, "days": days})
+
+
+@mcp.tool
+def get_dragon_tiger(date: str, code: str | None = None) -> str:
+    """Fetch the A-share dragon-tiger board (龙虎榜) for a trade date (Eastmoney).
+
+    Markets: China A-share (SH/SZ). Omit ``code`` for the full-market list of
+    every security on the board that day; supply ``code`` to also get that
+    security's ranked top buy/sell brokerage seats. Read-only, no auth.
+
+    Args:
+        date: Trade date in YYYY-MM-DD format (e.g. 2024-01-02).
+        code: Optional A-share symbol or bare code (e.g. "600519.SH" or "600519").
+    """
+    params: dict[str, Any] = {"date": date}
+    if code:
+        params["code"] = code
+    registry = _get_registry()
+    return registry.execute("get_dragon_tiger", params)
+
+
+@mcp.tool
+def get_northbound_flow(lookback_days: int = 30) -> str:
+    """Fetch Northbound (Stock-Connect) net capital flow for China A-shares.
+
+    Returns the latest realtime net inflow plus recent daily history, split into
+    Shanghai-Connect (沪股通) and Shenzhen-Connect (深股通) channels (units: 10k
+    CNY) from Eastmoney. Read-only; China A-share market only.
+
+    Args:
+        lookback_days: Trailing trading days of daily net-inflow history to return.
+    """
+    registry = _get_registry()
+    return registry.execute("get_northbound_flow", {"lookback_days": lookback_days})
+
+
+@mcp.tool
+def get_margin_trading(code: str, days: int = 30) -> str:
+    """Fetch an A-share stock's daily margin-trading (融资融券) balances (Eastmoney).
+
+    Returns outstanding financing balance, financing buy amount,
+    securities-lending balance, and combined RZRQ balance, one row per trading
+    day (most recent first). Read-only, no credentials, A-shares only (SH/SZ).
+
+    Args:
+        code: A-share code: bare ("600519"), suffixed ("600519.SH"), or
+            exchange-prefixed ("sh600519").
+        days: Number of most-recent trading days to return.
+    """
+    registry = _get_registry()
+    return registry.execute("get_margin_trading", {"code": code, "days": days})
+
+
+@mcp.tool
+def get_block_trades(code: str, days: int = 30) -> str:
+    """Fetch recent A-share block trades (大宗交易) for one symbol (Eastmoney).
+
+    Returns per-deal price, volume, amount, the premium/discount versus that
+    day's close, and the buyer/seller broker seats (营业部). Markets: China
+    A-share only (.SH/.SZ/.BJ). Read-only.
+
+    Args:
+        code: A-share symbol with exchange suffix, e.g. "600519.SH", "830799.BJ".
+        days: Lookback window in calendar days ending today.
+    """
+    registry = _get_registry()
+    return registry.execute("get_block_trades", {"code": code, "days": days})
+
+
+@mcp.tool
+def get_shareholder_count(code: str, max_periods: int = 24) -> str:
+    """Fetch mainland A-share quarterly shareholder count (股东户数) (Eastmoney).
+
+    Returns holder count per report period, quarter-over-quarter change
+    (absolute and percent), and average holding (shares and market value) per
+    account. Markets: China A-shares only (.SH/.SZ/.BJ).
+
+    Args:
+        code: A-share symbol in <code>.<exchange> form (SH/SZ/BJ).
+        max_periods: Maximum number of most-recent report periods to return.
+    """
+    registry = _get_registry()
+    return registry.execute("get_shareholder_count", {"code": code, "max_periods": max_periods})
+
+
+@mcp.tool
+def get_lockup_expiry(code: str | None = None, horizon_days: int = 90) -> str:
+    """Fetch Chinese A-share lockup-expiry (restricted-share unlock, 限售解禁) data.
+
+    Pass an A-share ``code`` to get that stock's full historical unlock
+    schedule, or omit it for a market-wide calendar of upcoming unlocks within
+    the next ``horizon_days`` (Eastmoney). A large near-term unlock adds
+    tradable supply and often pressures the stock. Read-only.
+
+    Args:
+        code: A-share symbol (e.g. "600519", "600519.SH"). Omit for a
+            market-wide upcoming-unlock calendar.
+        horizon_days: Upcoming-unlock window in days for the market-wide
+            calendar; ignored when ``code`` is given (full history is returned).
+    """
+    params: dict[str, Any] = {"horizon_days": horizon_days}
+    if code:
+        params["code"] = code
+    registry = _get_registry()
+    return registry.execute("get_lockup_expiry", params)
+
+
+@mcp.tool
+def get_sector_info(code: str | None = None, mode: str = "membership", limit: int = 30) -> str:
+    """Look up Chinese A-share sector / concept board info (Eastmoney, no auth).
+
+    Two modes: (1) membership — given a stock ``code``, list the industry and
+    concept boards it belongs to; (2) ranking — set ``mode="ranking"`` to rank
+    industry boards by today's percent change (with up/down constituent counts
+    and the leading stock). Market: A-share stocks.
+
+    Args:
+        code: A-share stock symbol with market suffix. Required when
+            mode="membership"; ignored when mode="ranking".
+        mode: "membership" (default) or "ranking".
+        limit: For mode="ranking", number of top boards to return.
+    """
+    params: dict[str, Any] = {"mode": mode, "limit": limit}
+    if code:
+        params["code"] = code
+    registry = _get_registry()
+    return registry.execute("get_sector_info", params)
+
+
+@mcp.tool
+def get_research_reports(code: str, limit: int = 20) -> str:
+    """Fetch mainland A-share sell-side research coverage and consensus forecasts.
+
+    Returns recent broker research reports (title, brokerage, analyst, publish
+    date, rating) with each broker's per-year EPS and PE forecasts from
+    Eastmoney, plus the market consensus (mean) EPS forecast per forward fiscal
+    year from THS (同花顺). Markets: China A-shares only (.SH/.SZ/.BJ).
+
+    Args:
+        code: A-share symbol in <code>.<exchange> form (SH/SZ/BJ).
+        limit: Maximum number of most-recent research reports to return.
+    """
+    registry = _get_registry()
+    return registry.execute("get_research_reports", {"code": code, "limit": limit})
+
+
+@mcp.tool
+def get_stock_news(code: str | None = None, scope: str = "stock", limit: int = 20) -> str:
+    """Fetch recent financial news headlines, read-only and no auth.
+
+    Markets: China A-share (SH/SZ/BJ) headlines from Eastmoney; US (.US) and
+    Hong Kong (.HK) related-instrument matches from Yahoo Finance. Use scope
+    "stock" with a ``code`` for one security's headlines, or scope "global"
+    (no code) for broad China-market finance news.
+
+    Args:
+        code: Symbol whose news to fetch (e.g. "600519.SH", "AAPL.US").
+            Required when scope="stock"; ignored when scope="global".
+        scope: "stock" (default) or "global".
+        limit: Maximum number of headlines to return.
+    """
+    params: dict[str, Any] = {"scope": scope, "limit": limit}
+    if code:
+        params["code"] = code
+    registry = _get_registry()
+    return registry.execute("get_stock_news", params)
+
+
+@mcp.tool
+def get_sec_filings(
+    ticker: str,
+    form: str | None = None,
+    metric: str | None = None,
+    limit: int = 20,
+) -> str:
+    """Fetch U.S. SEC EDGAR filings or reported XBRL financials for a company.
+
+    Returns a list of recent filings (10-K / 10-Q / 8-K, etc.) with accession
+    number, filing and report dates, and the primary-document URL; or, when
+    ``metric`` is given, the reported XBRL us-gaap financial series for that
+    concept (e.g. Revenues, NetIncomeLoss, Assets). Markets: United States only.
+
+    Args:
+        ticker: U.S. equity ticker, case-insensitive (e.g. "AAPL").
+        form: Optional SEC form type filter (e.g. "10-K", "10-Q", "8-K").
+        metric: Optional XBRL us-gaap concept name (e.g. "Revenues").
+        limit: Maximum number of most-recent filings and metric points to return.
+    """
+    params: dict[str, Any] = {"ticker": ticker, "limit": limit}
+    if form:
+        params["form"] = form
+    if metric:
+        params["metric"] = metric
+    registry = _get_registry()
+    return registry.execute("get_sec_filings", params)
+
+
+@mcp.tool
+def get_financial_statements(code: str, statement: str = "indicators", period: str = "annual") -> str:
+    """Fetch a stock's financial statements or key per-period indicators.
+
+    Markets: A-share (.SH/.SZ/.BJ, via Sina), US (.US) and Hong Kong (.HK, via
+    Eastmoney). Reports come back newest-first as flat per-period rows. Use this
+    to read fundamentals before building a valuation or screen.
+
+    Args:
+        code: Single symbol with a market suffix (e.g. "600519.SH", "AAPL.US").
+        statement: "balance", "income", "cashflow", or "indicators".
+        period: "annual" or "quarter".
+    """
+    registry = _get_registry()
+    return registry.execute(
+        "get_financial_statements",
+        {"code": code, "statement": statement, "period": period},
+    )
+
+
+@mcp.tool
+def get_options_chain(ticker: str, expiration: int | None = None) -> str:
+    """Fetch the US-listed options chain (calls and puts) for one expiration.
+
+    Returns per-contract strike, bid/ask, last price, volume, open interest,
+    implied volatility, and in-the-money flag, plus the list of available
+    expirations (epoch seconds) via Yahoo Finance. Read-only US options data.
+
+    Args:
+        ticker: US underlying symbol (e.g. "AAPL" or "AAPL.US").
+        expiration: Optional expiration as Unix epoch seconds (one of the
+            returned expirations). Omit for the nearest expiration.
+    """
+    params: dict[str, Any] = {"ticker": ticker}
+    if expiration is not None:
+        params["expiration"] = expiration
+    registry = _get_registry()
+    return registry.execute("get_options_chain", params)
+
+
+@mcp.tool
+def get_stock_profile(ticker: str, sections: list[str] | None = None) -> str:
+    """Fetch a read-only company profile for a US or HK listing (Yahoo Finance).
+
+    Returns valuation key statistics, analyst price targets and
+    earnings/revenue estimates, institutional and insider ownership, and the
+    analyst recommendation trend. Use this for fundamentals and consensus
+    context, not for OHLCV price bars (use get_market_data).
+
+    Args:
+        ticker: US (bare or .US suffix) or HK (zero-padded .HK code) symbol.
+        sections: Profile sections to return, any of: key_stats, financials,
+            earnings_trend, institution_ownership, insider_holders,
+            recommendation_trend. Defaults to all sections.
+    """
+    params: dict[str, Any] = {"ticker": ticker}
+    clean_sections = _clean_list(sections)
+    if clean_sections:
+        params["sections"] = clean_sections
+    registry = _get_registry()
+    return registry.execute("get_stock_profile", params)
+
+
+@mcp.tool
+def screen_market(market: str, sort_by: str = "change_pct", top_n: int = 30) -> str:
+    """Screen a market's listed instruments and rank the top names by a metric.
+
+    Use this to find today's biggest movers or most-actively-traded names
+    without fetching every symbol. Markets: A-share ("a"), US ("us"), Hong
+    Kong ("hk").
+
+    Args:
+        market: Market universe: "a", "us", or "hk".
+        sort_by: Ranking metric (descending): "change_pct", "volume",
+            "amount", or "turnover".
+        top_n: Number of top-ranked instruments to return.
+    """
+    registry = _get_registry()
+    return registry.execute("screen_market", {"market": market, "sort_by": sort_by, "top_n": top_n})
+
+
+@mcp.tool
+def search_symbol(query: str, limit: int = 10) -> str:
+    """Resolve a company name or ticker fragment to candidate trading symbols.
+
+    Returns candidates with their market in the project's symbol convention
+    (A-shares 600519.SH, Hong Kong 00700.HK, U.S. AAPL.US, plus crypto/index/FX
+    from Yahoo). Searches Eastmoney and Yahoo and, for U.S. equities, attaches
+    the SEC CIK. Use this to turn an ambiguous name into a concrete symbol
+    before calling get_market_data or get_sec_filings.
+
+    Args:
+        query: Free-text company name or ticker fragment (Chinese or English).
+        limit: Maximum number of merged candidates to return.
+    """
+    registry = _get_registry()
+    return registry.execute("search_symbol", {"query": query, "limit": limit})
+
+
+@mcp.tool
+def get_macro_series(
+    series_id: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int = 2000,
+) -> str:
+    """Fetch a FRED macroeconomic time series from the St. Louis Fed.
+
+    Returns dated observations of indicators such as CPI (CPIAUCSL),
+    unemployment (UNRATE), real GDP (GDPC1), the federal funds rate (FEDFUNDS),
+    or the 10-year Treasury yield (DGS10). Markets: US / global macro data.
+    Requires a free FRED API key (FRED_API_KEY); without it the tool returns a
+    not-available error.
+
+    Args:
+        series_id: FRED series identifier (e.g. "CPIAUCSL", "UNRATE").
+        start_date: Inclusive window start, YYYY-MM-DD. Omit for full history.
+        end_date: Inclusive window end, YYYY-MM-DD. Omit for the latest date.
+        limit: Maximum number of most-recent observations to return.
+    """
+    params: dict[str, Any] = {"series_id": series_id, "limit": limit}
+    if start_date:
+        params["start_date"] = start_date
+    if end_date:
+        params["end_date"] = end_date
+    return _execute_key_gated("get_macro_series", params)
+
+
+@mcp.tool
+def iwencai_search(query: str, limit: int = 20) -> str:
+    """Run a natural-language A-share research query against iWenCai (问财).
+
+    iWenCai is a Chinese-market semantic stock screener. Phrase the question in
+    plain language (Chinese works best) and get back the matching China A-share
+    (SH/SZ) securities with the metric columns iWenCai parsed from the question.
+    Read-only; requires the VIBE_TRADING_IWENCAI_KEY access key (without it the
+    tool returns a not-available error).
+
+    Args:
+        query: Natural-language research question (Chinese phrasing yields the
+            best parse, e.g. "市盈率低于15的银行股").
+        limit: Maximum securities to return.
+    """
+    return _execute_key_gated("iwencai_search", {"query": query, "limit": limit})
 
 
 # ---------------------------------------------------------------------------
@@ -1233,7 +1824,10 @@ def get_swarm_status(run_id: str) -> str:
         run_id: The run ID returned by run_swarm.
     """
     store = _get_swarm_store()
-    run = store.load_run(run_id)
+    try:
+        run = store.load_run(run_id)
+    except ValueError as exc:
+        return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
     if run is None:
         return json.dumps({"status": "error", "error": f"Run {run_id} not found"}, ensure_ascii=False)
     reconciled = store.reconcile_run(run, write=True)
@@ -1257,7 +1851,10 @@ def get_run_result(run_id: str) -> str:
         run_id: The run ID returned by run_swarm.
     """
     store = _get_swarm_store()
-    run = store.load_run(run_id)
+    try:
+        run = store.load_run(run_id)
+    except ValueError as exc:
+        return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
     if run is None:
         return json.dumps({"status": "error", "error": f"Run {run_id} not found"}, ensure_ascii=False)
     reconciled = store.reconcile_run(run, write=True)
@@ -1341,7 +1938,10 @@ def retry_run(run_id: str) -> str:
     from src.swarm.runtime import SwarmRuntime
 
     store = _get_swarm_store()
-    loaded = store.load_run(run_id)
+    try:
+        loaded = store.load_run(run_id)
+    except ValueError as exc:
+        return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
     if loaded is None:
         return json.dumps({"status": "error", "error": f"Run {run_id} not found"}, ensure_ascii=False)
 
@@ -1543,15 +2143,50 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Vibe-Trading MCP Server")
-    parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio", help="MCP transport (default: stdio)")
-    parser.add_argument("--port", type=int, default=8900, help="SSE port (only used with --transport sse)")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse", "http"],
+        default="stdio",
+        help="MCP transport (default: stdio). 'http' = Streamable HTTP (current spec default), "
+        "served at POST/GET /mcp. 'sse' = legacy deprecated SSE (GET /sse + POST /messages/).",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Network bind host for --transport sse / http (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port", type=int, default=8900, help="SSE/HTTP port (default: 8900)"
+    )
+    parser.add_argument(
+        "--enable-shell-tools",
+        action="store_true",
+        help="Register the bash / background_run shell tools (arbitrary OS "
+        "command execution — RCE surface). OFF by default for every transport; "
+        "equivalent to setting VIBE_TRADING_ENABLE_SHELL_TOOLS=1.",
+    )
     args = parser.parse_args()
-    _include_shell_tools = True if args.transport == "stdio" else _env_shell_tools_enabled()
+    _include_shell_tools = _resolve_include_shell_tools(args.enable_shell_tools)
     _registry = None
     _get_registry()  # pre-warm: avoids deadlock when first tools/call lazy-inits inside FastMCP worker thread
 
-    if args.transport == "sse":
-        mcp.run(transport="sse", port=args.port)
+    if args.transport in ("sse", "http"):
+        # Network transports bind a TCP port and are therefore reachable by a
+        # DNS-rebinding page in the user's browser. fastmcp 3.2.4 has no
+        # built-in host/origin guard, so wrap the ASGI app with a Host + Origin
+        # allow-list (default loopback-only) and serve via uvicorn directly.
+        # 'http' = Streamable HTTP (single /mcp endpoint, MCP spec 2025-03-26+),
+        # replacing the deprecated two-endpoint SSE transport for modern clients.
+        import uvicorn
+
+        from src.config.accessor import get_env_config
+
+        allowed_hosts = _parse_allowed_hosts(
+            get_env_config().api.vibe_trading_mcp_allowed_hosts
+        )
+        transport = "streamable-http" if args.transport == "http" else "sse"
+        app = _build_network_app(transport, allowed_hosts)
+        uvicorn.run(app, host=args.host, port=args.port)
     else:
         mcp.run()
 

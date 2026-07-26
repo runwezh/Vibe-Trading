@@ -19,7 +19,15 @@ from src.agent.tools import BaseTool
 logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_SECONDS = 5
-_MAX_WAIT_SECONDS = int(os.getenv("SWARM_TIMEOUT", "1800"))
+
+
+def _max_wait_seconds() -> int:
+    import sys as _sys
+    _mod = _sys.modules.get(__name__)
+    if _mod is not None and "_MAX_WAIT_SECONDS" in _mod.__dict__:
+        return _mod.__dict__["_MAX_WAIT_SECONDS"]
+    from src.config.accessor import get_env_config
+    return get_env_config().swarm.swarm_timeout
 
 # Preset matching: (preset_name, keyword_patterns, weight_boost). Patterns match user intent (EN + ZH).
 _PRESET_KEYWORDS: list[tuple[str, list[str], float]] = [
@@ -235,6 +243,22 @@ _PRESET_KEYWORDS: list[tuple[str, list[str], float]] = [
         0.9,
     ),
     (
+        "value_investing_committee",
+        [
+            r"value\s+investing",
+            "价值投资",
+            r"\bbuffett\b",
+            "巴菲特",
+            r"\bmunger\b",
+            "芒格",
+            "段永平",
+            "李录",
+            "四大师",
+            r"four\s+master",
+        ],
+        0.9,
+    ),
+    (
         "investment_committee",
         [
             r"investment\s+committee",
@@ -394,6 +418,84 @@ def _match_preset(prompt: str) -> str:
     return "equity_research_team"
 
 
+_PRESET_NAMES = {preset_name for preset_name, _, _ in _PRESET_KEYWORDS}
+_CONTINUATION_PATTERNS = (
+    r"^\s*continue\b",
+    r"^\s*resume\b",
+    r"^\s*finish\b",
+    r"\bcontinue\s+(?:and\s+)?finish\b",
+    r"\bcontinue\s+from\b",
+    r"\bfinish\s+(?:the\s+)?report\b",
+    r"\bcomplete\s+(?:the\s+)?report\b",
+    r"\bpick\s+up\s+from\b",
+    r"^\s*继续",
+    r"^\s*接着",
+)
+
+
+def _normalize_preset_name(value: str) -> str | None:
+    """Normalize an explicit preset name and validate it resolves to a preset.
+
+    Names in the static routing table are accepted as before. Names outside it
+    are accepted only when they resolve to an actual preset file — which lets
+    explicitly named user presets (``~/.vibe-trading/swarm/presets/``) run
+    through this tool. Keyword ROUTING stays limited to the curated table: a
+    user preset is reachable only by naming it, never by keyword match.
+    """
+    normalized = re.sub(r"[\s-]+", "_", value.strip().lower())
+    if normalized in _PRESET_NAMES:
+        return normalized
+    from src.swarm.presets import resolve_preset_path
+
+    try:
+        if resolve_preset_path(normalized) is not None:
+            return normalized
+    except ValueError:
+        return None
+    return None
+
+
+def _has_preset_signal(prompt: str) -> bool:
+    """Return whether prompt contains an explicit preset name or routing keyword."""
+    normalized_prompt = re.sub(r"[\s-]+", "_", prompt.strip().lower())
+    for preset_name, _, _ in _PRESET_KEYWORDS:
+        if re.search(rf"(?<![a-z0-9]){re.escape(preset_name)}(?![a-z0-9])", normalized_prompt):
+            return True
+    for _, keywords, _ in _PRESET_KEYWORDS:
+        for kw in keywords:
+            if re.search(kw, prompt, re.IGNORECASE):
+                return True
+    return False
+
+
+def _looks_like_continuation_prompt(prompt: str) -> bool:
+    """Detect prompts that refer to prior work instead of a fresh swarm task."""
+    return any(re.search(pattern, prompt, re.IGNORECASE) for pattern in _CONTINUATION_PATTERNS)
+
+
+def _resolve_preset(prompt: str, explicit_preset: str | None = None) -> tuple[str | None, str | None]:
+    """Resolve the preset to run, returning an error string when ambiguous."""
+    if explicit_preset:
+        preset = _normalize_preset_name(explicit_preset)
+        if preset is None:
+            available = ", ".join(sorted(_PRESET_NAMES))
+            return None, (
+                f"Unknown preset_name '{explicit_preset}'. Available presets: {available}. "
+                "User presets in ~/.vibe-trading/swarm/presets/ are also accepted by name."
+            )
+        return preset, None
+
+    if _looks_like_continuation_prompt(prompt) and not _has_preset_signal(prompt):
+        return (
+            None,
+            "Ambiguous continuation swarm prompt. Reuse the previous swarm result, "
+            "or call run_swarm with preset_name and the original full request. "
+            "Refusing to auto-route this continuation to equity_research_team.",
+        )
+
+    return _match_preset(prompt), None
+
+
 def _extract_market(prompt: str) -> str:
     """Extract target market label from prompt.
 
@@ -550,6 +652,7 @@ def _build_variables(preset_name: str, prompt: str) -> dict[str, str]:
         "geopolitical_war_room": {"crisis": g, "market": market},
         "pairs_research_lab": {"market": market, "sector": _extract_sector(prompt)},
         "investment_committee": {"target": g, "market": market},
+        "value_investing_committee": {"company": g, "market": market},
         "macro_strategy_forum": {"market": market, "horizon": "quarterly"},
         "statistical_arbitrage_desk": {"market": market, "goal": g, "sector": _extract_sector(prompt)},
         "sentiment_intelligence_team": {"market": market, "timeframe": "daily"},
@@ -572,10 +675,10 @@ class SwarmTool(BaseTool):
     name = "run_swarm"
     description = (
         "Run a multi-agent swarm team for complex analysis tasks. "
-        "Provide a natural language prompt; the tool picks a preset from agent/src/swarm/presets "
+        "Provide a natural language prompt and, when known, an explicit preset_name from agent/src/swarm/presets "
         "(e.g. equity_research_team, quant_strategy_desk, global_allocation_committee, risk_committee) "
-        "and fills template variables. "
-        "Example: run_swarm(prompt='Analyze A-share new energy opportunities for Q2 2026')"
+        "so follow-up/continuation prompts do not lose routing context. "
+        "Example: run_swarm(prompt='Analyze A-share new energy opportunities for Q2 2026', preset_name='equity_research_team')"
     )
     parameters = {
         "type": "object",
@@ -583,6 +686,10 @@ class SwarmTool(BaseTool):
             "prompt": {
                 "type": "string",
                 "description": "Natural language description of the analysis task.",
+            },
+            "preset_name": {
+                "type": "string",
+                "description": "Optional explicit swarm preset name when the user named one or this is a continuation.",
             },
         },
         "required": ["prompt"],
@@ -632,11 +739,17 @@ class SwarmTool(BaseTool):
                 ensure_ascii=False,
             )
 
-        preset = _match_preset(prompt)
+        preset, preset_error = _resolve_preset(prompt, kwargs.get("preset_name"))
+        if preset_error:
+            return json.dumps(
+                {"status": "error", "error": preset_error},
+                ensure_ascii=False,
+            )
+        assert preset is not None
         variables = _build_variables(preset, prompt)
 
         logger.info(
-            "SwarmTool: matched preset=%s, variables=%s from prompt: %s",
+            "SwarmTool: resolved preset=%s, variables=%s from prompt: %s",
             preset,
             variables,
             prompt[:100],
@@ -653,9 +766,11 @@ class SwarmTool(BaseTool):
         # agent tool, the config path is resolved from disk / env, never from
         # the calling LLM's prompt (R-06).
         agent_config = load_swarm_agent_config()
+        from src.config.accessor import get_env_config
+
         runtime = SwarmRuntime(
             store=store,
-            max_workers=int(os.getenv("SWARM_MAX_WORKERS", "4")),
+            max_workers=get_env_config().swarm.swarm_max_workers,
             agent_config=agent_config,
         )
 
@@ -718,7 +833,8 @@ class SwarmTool(BaseTool):
         pending_live_events.clear()
 
         t0 = time.monotonic()
-        while time.monotonic() - t0 < _MAX_WAIT_SECONDS:
+        max_wait = _max_wait_seconds()
+        while time.monotonic() - t0 < max_wait:
             time.sleep(_POLL_INTERVAL_SECONDS)
 
             loaded = store.load_run(run_id)
@@ -744,7 +860,7 @@ class SwarmTool(BaseTool):
             )
 
         return json.dumps(
-            {"status": "timeout", "error": f"Swarm run {run_id} timed out after {_MAX_WAIT_SECONDS}s"},
+            {"status": "timeout", "error": f"Swarm run {run_id} timed out after {max_wait}s"},
             ensure_ascii=False,
         )
 
@@ -789,3 +905,9 @@ def _format_result(
         },
     }
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def __getattr__(name: str):
+    if name == "_MAX_WAIT_SECONDS":
+        return _max_wait_seconds()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

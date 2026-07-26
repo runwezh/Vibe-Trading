@@ -27,6 +27,9 @@ _MARKET_PATTERNS = [
     (re.compile(r"^(51|15|56)\d{4}\.(SZ|SH)$", re.I), "a_share"),
     (re.compile(r"^[A-Z]+\.US$", re.I), "us_equity"),
     (re.compile(r"^\d{3,5}\.HK$", re.I), "hk_equity"),
+    # India equities: NSE (RELIANCE.NS) / BSE (500325.BO); tickers may carry
+    # '&' and '-' (e.g. M&M.NS, BAJAJ-AUTO.NS).
+    (re.compile(r"^[A-Z0-9&.\-]+\.(NS|BO)$", re.I), "india_equity"),
     (re.compile(r"^[A-Z]+-USDT$", re.I), "crypto"),
     (re.compile(r"^[A-Z]+/USDT$", re.I), "crypto"),
     # China futures: product+delivery.exchange (e.g. IF2406.CFFEX, rb2410.SHFE)
@@ -161,7 +164,8 @@ def calc_crypto_funding_fee(
         bar: Current bar data.
         timestamp: Bar timestamp.
         positions: Shared positions dict.
-        funding_rate: Fixed rate per settlement.
+        funding_rate: Fallback fixed rate per settlement, used when the bar
+            carries no historical ``funding_rate`` column.
         applied_set: (symbol, date, hour) dedup set — mutated.
         daily_done_set: (symbol, date) dedup set — mutated.
 
@@ -191,6 +195,12 @@ def calc_crypto_funding_fee(
 
     mark_price = float(bar.get("close", pos.entry_price))
     notional = pos.size * mark_price
+    # Prefer the bar's historical funding rate when the loader supplied one
+    # (USD-M perpetual data via BASE-USDT-PERP); fall back to the fixed
+    # config rate otherwise so spot-proxy runs keep their behaviour.
+    hist = bar.get("funding_rate")
+    if hist is not None and pd.notna(hist):
+        funding_rate = float(hist)
     return notional * funding_rate * pos.direction
 
 

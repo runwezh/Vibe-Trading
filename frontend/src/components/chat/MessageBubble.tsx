@@ -1,15 +1,25 @@
+import i18n from '@/i18n';
 import { memo, useState, useCallback } from "react";
 import { User, XCircle, RefreshCw, Copy, Check } from "lucide-react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Options as ReactMarkdownOptions } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import rehypeHighlight from "rehype-highlight";
+import rehypeKatex from "rehype-katex";
+import "katex/dist/katex.min.css";
 import { formatTimestamp } from "@/lib/formatters";
+import { normalizeMathDelimiters } from "@/lib/markdown";
 import type { AgentMessage } from "@/types/agent";
 import { AgentAvatar } from "./AgentAvatar";
 import { RunCompleteCard } from "./RunCompleteCard";
 
-const remarkPlugins = [remarkGfm];
-const rehypePlugins = [rehypeHighlight];
+// singleDollarTextMath off: dollar amounts ("$150 to $120") must never parse as
+// formulas; LLM \(...\)/\[...\] delimiters are normalized to $$ before render.
+const remarkPlugins: ReactMarkdownOptions["remarkPlugins"] = [
+  remarkGfm,
+  [remarkMath, { singleDollarTextMath: false }],
+];
+const rehypePlugins: ReactMarkdownOptions["rehypePlugins"] = [rehypeHighlight, rehypeKatex];
 
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
@@ -23,7 +33,7 @@ function CopyButton({ text }: { text: string }) {
     <button
       onClick={handleCopy}
       className="absolute top-2 right-2 p-1.5 rounded-md bg-muted/80 hover:bg-muted text-muted-foreground hover:text-foreground opacity-0 group-hover:opacity-100 transition-opacity"
-      title={copied ? "Copied" : "Copy"}
+      title={copied ? i18n.t("messageBubble.copied") : i18n.t("messageBubble.copy")}
     >
       {copied ? <Check className="h-3.5 w-3.5 text-success" /> : <Copy className="h-3.5 w-3.5" />}
     </button>
@@ -33,12 +43,12 @@ function CopyButton({ text }: { text: string }) {
 function getRetryHint(content: string): string {
   const lower = content.toLowerCase();
   if (lower.includes("timeout") || lower.includes("timed out")) {
-    return "Execution timed out. Try simplifying the strategy or reducing the number of assets.";
+    return i18n.t("messageBubble.timeoutHint");
   }
   if (lower.includes("api") || lower.includes("rate limit") || lower.includes("429") || lower.includes("500") || lower.includes("502") || lower.includes("503")) {
-    return "API call failed. Please retry later.";
+    return i18n.t("messageBubble.apiFailedHint");
   }
-  return "Execution failed. Click to retry.";
+  return i18n.t("messageBubble.executionFailedHint");
 }
 
 interface Props {
@@ -70,7 +80,7 @@ export const MessageBubble = memo(function MessageBubble({ msg, onRetry }: Props
         <div className="flex-1 min-w-0 relative">
           <CopyButton text={msg.content} />
           <div className="prose prose-sm dark:prose-invert max-w-none leading-relaxed prose-table:border prose-table:border-border/50 prose-th:bg-muted/30 prose-th:px-3 prose-th:py-1.5 prose-td:px-3 prose-td:py-1.5 prose-th:text-left prose-th:text-xs prose-th:font-medium prose-td:text-xs prose-hr:hidden">
-            <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins}>{msg.content}</ReactMarkdown>
+            <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins}>{normalizeMathDelimiters(msg.content)}</ReactMarkdown>
           </div>
           {ts && <span className="text-[9px] text-muted-foreground/30 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">{ts}</span>}
         </div>

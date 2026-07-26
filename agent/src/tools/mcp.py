@@ -10,21 +10,34 @@ import os
 import re
 import threading
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
+from datetime import date, datetime
 from typing import Any, Awaitable, Callable, Coroutine, Iterable, Protocol, TypeVar
 
 from fastmcp.client import Client
 from fastmcp.client.auth import OAuth
 from fastmcp.client.client import CallToolResult
-from fastmcp.client.transports.http import StreamableHttpTransport
-from fastmcp.client.transports.sse import SSETransport
-from fastmcp.client.transports.stdio import StdioTransport
+try:
+    from fastmcp.client.transports.http import StreamableHttpTransport
+    from fastmcp.client.transports.sse import SSETransport
+    from fastmcp.client.transports.stdio import StdioTransport
+except ModuleNotFoundError:
+    from fastmcp.client.transports import (
+        SSETransport,
+        StdioTransport,
+        StreamableHttpTransport,
+    )
 from fastmcp.exceptions import McpError, ToolError
-from key_value.aio.stores.filetree import FileTreeStore
+from key_value.aio.stores.filetree import FileTreeStore, FileTreeV1KeySanitizationStrategy
 from mcp import types as mcp_types
 
 from src.agent.tools import BaseTool
-from src.config.schema import MCPServerConfig
+from src.config.schema import (
+    ROBINHOOD_AGENT_CONFIG_PATH,
+    MCPServerConfig,
+    live_broker_key_for_entry,
+    robinhood_readonly_enabled_tools,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +57,30 @@ _TRANSIENT_ERROR_TOKENS = (
 )
 
 ResultT = TypeVar("ResultT")
+
+_MCP_SPECS_CACHE: dict[tuple[str, ...], list["MCPRemoteToolSpec"]] = {}
+_MCP_SPECS_LOCK = threading.Lock()
+
+
+def _make_cache_key(server_name: str, server_config: "MCPServerConfig") -> tuple[str, ...]:
+    """Build a content-based cache key for MCP tool discovery results."""
+    return (
+        server_name,
+        server_config.command,
+        str(server_config.args or []),
+        str(sorted((server_config.env or {}).items())),
+        str(sorted(server_config.enabled_tools or [])),
+    )
+
+
+def invalidate_mcp_specs_cache() -> None:
+    """Clear the MCP tool discovery cache.
+
+    Called by SwarmRuntime at the start of each run to ensure fresh
+    discovery when operator config may have changed between runs.
+    """
+    with _MCP_SPECS_LOCK:
+        _MCP_SPECS_CACHE.clear()
 
 
 class AsyncMCPClient(Protocol):
@@ -108,6 +145,7 @@ def build_mcp_tool_wrappers(
     *,
     local_server_name: str | None = None,
     client_factory: ClientFactory | None = None,
+    max_list_tools_attempts: int = 2,
 ) -> list["MCPRemoteTool"]:
     """Build local tool wrappers for a configured MCP server.
 
@@ -119,6 +157,11 @@ def build_mcp_tool_wrappers(
             tool names stable when multiple raw server names sanitize to the
             same local prefix.
         client_factory: Optional async client factory for tests.
+        max_list_tools_attempts: Number of ``list_tools`` attempts during tool
+            discovery. Defaults to 2 (one transient retry). Set to 1 for the
+            interactive ``connector authorize`` bootstrap, where a retry would
+            start a second OAuth callback server and orphan the user's
+            in-progress sign-in.
 
     Returns:
         Local BaseTool wrappers for all enabled remote tools.
@@ -127,13 +170,39 @@ def build_mcp_tool_wrappers(
         Exception: Propagates discovery failures so callers can decide whether
             to warn, skip, or abort.
     """
+    # --- Cache lookup (thread-safe) ---
+    # Skip cache when a custom client_factory is provided (test injection).
+    cache_key: tuple[str, ...] | None = None
+    if client_factory is None:
+        cache_key = _make_cache_key(server_name, server_config)
+        with _MCP_SPECS_LOCK:
+            cached_specs = _MCP_SPECS_CACHE.get(cache_key)
+        if cached_specs is not None:
+            adapter = MCPServerAdapter(
+                server_name,
+                server_config,
+                local_server_name=local_server_name,
+                client_factory=client_factory,
+                max_list_tools_attempts=max_list_tools_attempts,
+            )
+            return [MCPRemoteTool(adapter=adapter, spec=spec) for spec in cached_specs]
+
+    # --- Original logic (cache miss) ---
     adapter = MCPServerAdapter(
         server_name,
         server_config,
         local_server_name=local_server_name,
         client_factory=client_factory,
+        max_list_tools_attempts=max_list_tools_attempts,
     )
-    return [MCPRemoteTool(adapter=adapter, spec=spec) for spec in adapter.discover_tools()]
+    specs = adapter.discover_tools()
+
+    # Store in cache (only for production path, not test injection)
+    if cache_key is not None:
+        with _MCP_SPECS_LOCK:
+            _MCP_SPECS_CACHE[cache_key] = specs
+
+    return [MCPRemoteTool(adapter=adapter, spec=spec) for spec in specs]
 
 
 def make_mcp_tool_name(server_name: str, tool_name: str) -> str:
@@ -254,15 +323,30 @@ def normalize_mcp_tool_schema(schema: dict[str, Any] | None) -> dict[str, Any]:
     return normalized
 
 
+def _format_zero_enabled_tools_warning(server_name: str, server_config: MCPServerConfig) -> str:
+    """Build a warning when discovery yields no locally enabled tools."""
+    enabled_tools = list(getattr(server_config, "enabled_tools", []) or [])
+    if "*" in enabled_tools and live_broker_key_for_entry(server_name, server_config) == "robinhood":
+        tools = ", ".join(robinhood_readonly_enabled_tools())
+        return (
+            f"Server '{server_name}' produced 0 enabled tools with wildcard enabledTools ['*']. "
+            "Robinhood live MCP must use the safe read-only allowlist "
+            f"({tools}); copy the safe seed into {ROBINHOOD_AGENT_CONFIG_PATH}."
+        )
+    return f"Server '{server_name}' produced 0 enabled tools — check the enabledTools allowlist in agent config."
+
+
 def _build_token_store(cache_dir: str) -> FileTreeStore:
     """Build a persistent OAuth token store rooted at ``cache_dir``.
 
     The directory is created (with parents) and locked down to ``0700`` so only
     the owning user can read the cached refresh tokens. ``FileTreeStore`` is a
     pure-stdlib ``AsyncKeyValue`` backend (no ``diskcache`` dependency) and uses
-    atomic same-directory temp-file renames for write safety. The OAuth provider
-    persists refreshed tokens back through this store, giving silent refresh
-    across CLI sessions.
+    atomic same-directory temp-file renames for write safety. FastMCP's OAuth
+    storage uses raw MCP URLs as logical keys, so key sanitization is enabled to
+    keep those URL-shaped keys as filesystem-safe cache-local filenames. The
+    collection names stay unchanged because token-presence checks scan FastMCP's
+    literal ``mcp-oauth-token`` collection directory.
 
     Args:
         cache_dir: Token cache directory. A leading ``~`` is expanded.
@@ -276,7 +360,10 @@ def _build_token_store(cache_dir: str) -> FileTreeStore:
     path.mkdir(parents=True, exist_ok=True)
     # 0700: owner-only. Tokens are secrets; no group/other access.
     os.chmod(path, 0o700)
-    return FileTreeStore(data_directory=path)
+    return FileTreeStore(
+        data_directory=path,
+        key_sanitization_strategy=FileTreeV1KeySanitizationStrategy(path),
+    )
 
 
 class MCPServerAdapter:
@@ -289,6 +376,7 @@ class MCPServerAdapter:
         *,
         local_server_name: str | None = None,
         client_factory: ClientFactory | None = None,
+        max_list_tools_attempts: int = 2,
     ) -> None:
         """Initialize the MCP server adapter.
 
@@ -298,11 +386,16 @@ class MCPServerAdapter:
             local_server_name: Optional local naming override used only for the
                 server portion of generated tool names.
             client_factory: Optional async client factory, mainly for tests.
+            max_list_tools_attempts: Number of ``list_tools`` attempts (>= 1).
+                Defaults to 2 (one transient retry). The authorize bootstrap
+                sets this to 1 so a retry cannot start a second OAuth callback
+                server and orphan an in-progress sign-in.
         """
         self.server_name = server_name
         self.local_server_name = local_server_name or server_name
         self.server_config = server_config
         self._client_factory = client_factory or self._build_client
+        self._list_tools_attempts = max(1, max_list_tools_attempts)
 
     def discover_tools(self) -> list[MCPRemoteToolSpec]:
         """Discover enabled tools from the remote MCP server.
@@ -338,10 +431,7 @@ class MCPServerAdapter:
             )
 
         if not specs:
-            logger.warning(
-                "Server '%s' produced 0 enabled tools — check the enabledTools allowlist in agent config.",
-                self.server_name,
-            )
+            logger.warning(_format_zero_enabled_tools_warning(self.server_name, self.server_config))
 
         return specs
 
@@ -429,8 +519,13 @@ class MCPServerAdapter:
 
         # Use a minimum of 30 s for init_timeout so cold-start servers (pip
         # install, docker pull, slow imports) do not trip the same short
-        # deadline as a per-call tool_timeout.
-        init_timeout = max(self.server_config.tool_timeout, 30.0)
+        # deadline as a per-call tool_timeout. OAuth-heavy servers may set an
+        # explicit init_timeout without widening ordinary tool-call timeout.
+        init_timeout = (
+            self.server_config.init_timeout
+            if self.server_config.init_timeout is not None
+            else max(self.server_config.tool_timeout, 30.0)
+        )
         return Client(
             transport,
             name=self.server_name,
@@ -439,7 +534,10 @@ class MCPServerAdapter:
         )
 
     async def _list_tools(self) -> list[mcp_types.Tool]:
-        """List remote tools with a single retry on transient failures.
+        """List remote tools, retrying once on transient failures by default.
+
+        The number of attempts is governed by ``self._list_tools_attempts``
+        (1 disables the retry, used by the authorize bootstrap).
 
         Returns:
             Remote MCP tool definitions.
@@ -447,7 +545,11 @@ class MCPServerAdapter:
         Raises:
             Exception: Propagates non-transient or exhausted failures.
         """
-        return await self._run_with_retry("list_tools", self._list_tools_once)
+        return await self._run_with_retry(
+            "list_tools",
+            self._list_tools_once,
+            attempts=self._list_tools_attempts,
+        )
 
     async def _list_tools_once(self) -> list[mcp_types.Tool]:
         """List remote tools without retry handling.
@@ -489,21 +591,26 @@ class MCPServerAdapter:
         self,
         operation_name: str,
         operation: Callable[[], Awaitable[ResultT]],
+        *,
+        attempts: int = 2,
     ) -> ResultT:
-        """Run an async MCP operation with a single transient retry.
+        """Run an async MCP operation with bounded transient retries.
 
         Args:
             operation_name: Human-readable operation label.
             operation: Async operation to execute.
+            attempts: Maximum attempts (>= 1). Defaults to 2 (one transient
+                retry). Pass 1 to disable retry — used by the authorize
+                bootstrap, where a retry restarts the OAuth flow.
 
         Returns:
             Operation result.
 
         Raises:
             Exception: Re-raises the last failure when retry is not allowed or
-                both attempts fail.
+                all attempts fail.
         """
-        attempts = 2
+        attempts = max(1, attempts)
         for attempt in range(1, attempts + 1):
             try:
                 return await operation()
@@ -968,6 +1075,16 @@ def _format_exception_message(exc: Exception) -> str:
 def _make_jsonable(value: Any) -> Any:
     """Convert FastMCP response payloads into JSON-serializable objects.
 
+    ``fastmcp``'s client auto-types ``CallToolResult.data`` from a tool's
+    output schema via ``json_schema_to_type``, which produces a plain
+    ``dataclasses`` instance (not a Pydantic ``BaseModel``) for any object
+    schema that doesn't set ``additionalProperties: true`` -- the common
+    case. Without a dedicated branch here, such an instance falls through
+    to the final ``return value`` unconverted; ``json.dumps``'s ``default``
+    then receives the same unconvertible object back and raises
+    ``ValueError: Circular reference detected``, since its cycle detector
+    can't distinguish "default() gave up" from an actual cycle.
+
     Args:
         value: Arbitrary response value.
 
@@ -976,6 +1093,10 @@ def _make_jsonable(value: Any) -> Any:
     """
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json", by_alias=True, exclude_none=True)
+    if is_dataclass(value) and not isinstance(value, type):
+        return {field.name: _make_jsonable(getattr(value, field.name)) for field in fields(value)}
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
     if isinstance(value, list):
         return [_make_jsonable(item) for item in value]
     if isinstance(value, dict):
@@ -1016,6 +1137,7 @@ __all__ = [
     "MCPServerAdapter",
     "build_mcp_tool_wrappers",
     "format_mcp_server_name_collision_warning",
+    "invalidate_mcp_specs_cache",
     "make_mcp_tool_name",
     "normalize_mcp_tool_schema",
     "resolve_mcp_server_tool_name_segments",

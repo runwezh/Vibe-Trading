@@ -11,6 +11,7 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
+from backtest.loaders._symbol_utils import _is_etf_listed
 from backtest.loaders.base import cached_loader_fetch, validate_date_range
 from backtest.loaders.registry import register
 
@@ -18,9 +19,21 @@ logger = logging.getLogger(__name__)
 
 _INTERVAL_MAP_DAILY = {
     "1D": "daily",
+    "1d": "daily",
     "1W": "weekly",
+    "1w": "weekly",
     "1M": "monthly",
 }
+
+# US/HK/ETF/forex serve daily bars only.
+_DAILY_ONLY_ALIASES = frozenset({"1d", "d", "day", "daily"})
+
+
+def _require_daily_interval(interval: str, market: str) -> None:
+    if str(interval).strip().lower() not in _DAILY_ONLY_ALIASES:
+        raise ValueError(
+            f"Unsupported interval {interval!r}; akshare {market} supports daily bars only"
+        )
 
 
 def _is_a_share(code: str) -> bool:
@@ -39,22 +52,7 @@ def _is_crypto(code: str) -> bool:
     return "-USDT" in code.upper() or "/USDT" in code.upper()
 
 
-# Exchange-listed ETF / LOF prefix codes:
-#   SH: 50/51/52/56/58 (ETFs), SZ: 15/16 (ETFs + LOFs).
-# Issue #50 — these symbols look like A-shares (.SH / .SZ) but stock_zh_a_hist
-# can't price them; route through fund_etf_hist_sina instead.
-_ETF_PREFIXES = frozenset({"15", "16", "50", "51", "52", "56", "58"})
 
-
-def _is_etf_listed(code: str) -> bool:
-    """Detect exchange-listed ETF / LOF symbols (e.g. 518880.SH, 159915.SZ)."""
-    upper = code.upper()
-    if not upper.endswith((".SH", ".SZ")):
-        return False
-    digits = upper.split(".")[0]
-    if len(digits) != 6 or not digits.isdigit():
-        return False
-    return digits[:2] in _ETF_PREFIXES
 
 
 def _is_forex(code: str) -> bool:
@@ -63,7 +61,9 @@ def _is_forex(code: str) -> bool:
     Issue #54 — forex symbols (EURUSD, GBPUSD, etc.) have no exchange suffix
     and previously fell through to the A-share endpoint.
     """
-    upper = code.upper().removesuffix(".FX")
+    # Accept the canonical slash form (EUR/USD) too, so the forex fallback
+    # chain (mt5 → akshare) actually engages for project-style codes.
+    upper = code.upper().removesuffix(".FX").replace("/", "")
     try:
         from akshare.forex.cons import symbol_market_map
     except Exception:
@@ -155,14 +155,18 @@ class DataLoader:
 
         # ETF check must precede A-share — 518880.SH ends with .SH but is an ETF.
         if _is_etf_listed(code):
+            _require_daily_interval(interval, "etf")
             return self._fetch_etf(ak, code, start_date, end_date)
         if _is_a_share(code):
             return self._fetch_a_share(ak, code, start_date, end_date, interval)
         if _is_us(code):
+            _require_daily_interval(interval, "us")
             return self._fetch_us(ak, code, start_date, end_date)
         if _is_hk(code):
+            _require_daily_interval(interval, "hk")
             return self._fetch_hk(ak, code, start_date, end_date)
         if _is_forex(code):
+            _require_daily_interval(interval, "forex")
             return self._fetch_forex(ak, code, start_date, end_date)
         # Default: try A-share
         return self._fetch_a_share(ak, code, start_date, end_date, interval)
@@ -172,7 +176,12 @@ class DataLoader:
     ) -> Optional[pd.DataFrame]:
         """Fetch A-share via stock_zh_a_hist."""
         symbol = code.split(".")[0]
-        period = _INTERVAL_MAP_DAILY.get(interval, "daily")
+        period = _INTERVAL_MAP_DAILY.get(interval)
+        if period is None:
+            raise ValueError(
+                f"Unsupported interval {interval!r}; akshare a-share supports "
+                f"{sorted(_INTERVAL_MAP_DAILY)}"
+            )
         sd = start_date.replace("-", "")
         ed = end_date.replace("-", "")
         df = ak.stock_zh_a_hist(
@@ -228,7 +237,7 @@ class DataLoader:
         — note ``最新价`` (latest) plays the role of close. Volume isn't reported,
         so we synthesize a zero column to satisfy the OHLCV contract.
         """
-        symbol = code.upper().removesuffix(".FX")
+        symbol = code.upper().removesuffix(".FX").replace("/", "")
         df = ak.forex_hist_em(symbol=symbol)
         if df is None or df.empty:
             return None

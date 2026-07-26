@@ -12,10 +12,12 @@ from src.trading.connectors.dhan.profiles import DHAN_PROFILES
 from src.trading.connectors.futu.profiles import FUTU_PROFILES
 from src.trading.connectors.ibkr.profiles import IBKR_PROFILES
 from src.trading.connectors.longbridge.profiles import LONGBRIDGE_PROFILES
+from src.trading.connectors.mt5.profiles import MT5_PROFILES
 from src.trading.connectors.okx.profiles import OKX_PROFILES
 from src.trading.connectors.robinhood.profiles import ROBINHOOD_PROFILES
 from src.trading.connectors.shoonya.profiles import SHOONYA_PROFILES
 from src.trading.connectors.tiger.profiles import TIGER_PROFILES
+from src.trading.connectors.trading212.profiles import TRADING212_PROFILES
 from src.trading.types import TradingProfile
 
 CONFIG_FILENAME = "trading-connections.json"
@@ -32,6 +34,8 @@ BUILTIN_PROFILES: tuple[TradingProfile, ...] = (
     *FUTU_PROFILES,
     *DHAN_PROFILES,
     *SHOONYA_PROFILES,
+    *TRADING212_PROFILES,
+    *MT5_PROFILES,
 )
 
 

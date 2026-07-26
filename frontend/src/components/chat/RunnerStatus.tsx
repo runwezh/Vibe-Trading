@@ -1,3 +1,4 @@
+import i18n from '@/i18n';
 import { memo, useCallback, useEffect, useState } from "react";
 import {
   Activity,
@@ -274,15 +275,24 @@ function BrokerRow({
  * runtime execution. Runner start/stop are privileged surface fetches (`api.startLiveRunner` /
  * `api.stopLiveRunner`), never chat messages. Collapses to a compact toggle.
  */
+export function isVisibleRuntimeConnector(broker: LiveBrokerStatus): boolean {
+  const auth = broker.auth;
+  if (auth.oauth_token_present || auth.configured === true) return true;
+  return auth.connection_state === "connected" || auth.connection_state === "ready";
+}
+
 export const RunnerStatus = memo(function RunnerStatus({ status, unavailable, halted, onRefresh }: Props) {
   const [open, setOpen] = useState(false);
+  const visibleBrokers = status?.brokers.filter(isVisibleRuntimeConnector) ?? [];
 
   if (unavailable) return null;
-  if (!status || status.brokers.length === 0) return null;
+  if (!status || visibleBrokers.length === 0) return null;
 
   const isHalted = halted ?? status.global_halted;
-  const anyRunning = status.brokers.some((b) => b.runner?.alive);
-  const authorizedCount = status.brokers.filter((b) => b.auth.oauth_token_present).length;
+  const anyRunning = visibleBrokers.some((b) => b.runner?.alive);
+  const authorizedCount = visibleBrokers.filter(
+    (b) => b.auth.oauth_token_present || b.auth.connection_state === "connected"
+  ).length;
 
   return (
     <div className="grid gap-2">
@@ -290,32 +300,36 @@ export const RunnerStatus = memo(function RunnerStatus({ status, unavailable, ha
         type="button"
         onClick={() => setOpen((v) => !v)}
         className="inline-flex max-w-full items-center gap-1.5 justify-self-start rounded-lg bg-primary/10 px-2.5 py-1 text-left text-xs font-medium text-primary transition-colors hover:bg-primary/15"
-        aria-label="Connector runtime status"
+        aria-label={i18n.t("runnerStatus.connectorRuntime")}
         aria-expanded={open}
       >
         <Activity className="h-3 w-3 shrink-0" />
-        <span className="shrink-0">Connector runtime</span>
+        <span className="shrink-0">{i18n.t("runnerStatus.connectorRuntime")}</span>
         <span className="truncate text-muted-foreground">
-          {authorizedCount > 0 ? `${authorizedCount} connected` : "no connector connected"}
+          {authorizedCount > 0 ? i18n.t("runnerStatus.connected", { count: authorizedCount }) : i18n.t("runnerStatus.noConnector")}
         </span>
         {anyRunning && !isHalted && (
           <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
             <CircleDot className="h-2.5 w-2.5" />
-            running
+            {i18n.t("runnerStatus.running")}
           </span>
         )}
         {isHalted && (
           <span className="inline-flex items-center gap-1 rounded-full bg-destructive/10 px-1.5 py-0.5 text-[10px] font-medium text-destructive">
             <OctagonX className="h-2.5 w-2.5" />
-            halted
+            {i18n.t("runnerStatus.halted")}
           </span>
         )}
         <ChevronDown className={["h-3 w-3 shrink-0 transition-transform", open ? "rotate-180" : ""].join(" ")} aria-hidden="true" />
       </button>
 
       {open && (
-        <div className="grid gap-2 rounded-xl border border-primary/20 bg-background/95 p-3 shadow-sm">
-          {status.brokers.map((broker) => (
+        <div
+          role="region"
+          aria-label={i18n.t("runnerStatus.configuredProfiles")}
+          className="grid max-h-[min(70vh,36rem)] gap-2 overflow-y-auto rounded-xl border border-primary/20 bg-background/95 p-3 shadow-sm"
+        >
+          {visibleBrokers.map((broker) => (
             <BrokerRow key={broker.auth.broker} broker={broker} halted={isHalted || broker.halted} onRefresh={onRefresh} />
           ))}
         </div>

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,7 +18,12 @@ from src.agent.progress import HeartbeatTimer
 from src.agent.skills import SkillsLoader
 from src.agent.tools import ToolRegistry
 from src.config.schema import AgentConfig
-from src.providers.chat import ChatLLM
+from src.providers.chat import ChatLLM, LLMResponse, ProviderStreamError
+from src.providers.content_filter import (
+    CONTENT_FILTER_SKIP_MESSAGE,
+    MAX_CONSECUTIVE_CONTENT_FILTER_SKIPS,
+    compute_content_filter_warnings,
+)
 from src.swarm.models import (
     SwarmAgentSpec,
     SwarmEvent,
@@ -32,8 +36,14 @@ from src.tools.redaction import is_sensitive_arg, redact_payload
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MAX_ITERATIONS = int(os.getenv("SWARM_WORKER_MAX_ITER", "50"))
-_DEFAULT_TIMEOUT_SECONDS = int(os.getenv("SWARM_WORKER_TIMEOUT", "300"))
+def _default_max_iterations() -> int:
+    from src.config.accessor import get_env_config
+    return get_env_config().swarm.swarm_worker_max_iter
+
+
+def _default_timeout_seconds() -> int:
+    from src.config.accessor import get_env_config
+    return get_env_config().swarm.swarm_worker_timeout
 
 
 def _heartbeat_interval_s() -> float:
@@ -43,13 +53,26 @@ def _heartbeat_interval_s() -> float:
     — both sides use the same env var, so they must fail the same way. A bad
     value (``"abc"``, empty) falls back to 3.0s instead of crashing import.
     """
-    try:
-        return float(os.getenv("SWARM_HEARTBEAT_INTERVAL_S", "3.0"))
-    except ValueError:
-        return 3.0
+    from src.config.accessor import get_env_config
+
+    return get_env_config().swarm.swarm_heartbeat_interval_s
+
+
+def _stream_retry_delay_s() -> float:
+    """Resolve the delay before the single stream retry, robust to garbage.
+
+    Returns:
+        Seconds to sleep between a failed ``stream_chat`` attempt and its one
+        retry. Configurable via ``SWARM_STREAM_RETRY_DELAY_S``; a bad value
+        falls back to 1.0s instead of crashing import.
+    """
+    from src.config.accessor import get_env_config
+
+    return get_env_config().swarm.swarm_stream_retry_delay_s
 
 
 _HEARTBEAT_INTERVAL_S = _heartbeat_interval_s()
+_STREAM_RETRY_DELAY_S = _stream_retry_delay_s()
 _MAX_TOKEN_ESTIMATE = 60_000
 
 
@@ -202,6 +225,17 @@ def build_worker_prompt(
         # instruction to prefer these prices over training data.
         prompt_parts.append(grounding_block)
 
+    if "get_market_data" in (agent_spec.tools or []):
+        prompt_parts.append(
+            "## Market Data Tool Policy\n\n"
+            "For OHLCV price bars, recent closes, volume, technical indicators, "
+            "or return calculations, call `get_market_data` before writing raw "
+            "provider scripts. It uses the repository loader layer, normalizes "
+            "symbols, drops malformed OHLC rows, and returns strict JSON. Use "
+            "raw yfinance scripts only for fields outside OHLCV coverage, such "
+            "as fundamentals, holders, options, or corporate metadata."
+        )
+
     # Universal anti-fabrication rule. The grounding_block carries a similar
     # instruction but only renders when user_vars supplies explicit symbols.
     # Free-form prompts ("look at A-share short-term sentiment") otherwise
@@ -250,10 +284,10 @@ def build_worker_prompt(
         "- Respond in the same language as the task prompt."
     )
 
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     prompt_parts.append(
         f"## Current Date & Time\n\n"
-        f"Today is {now.strftime('%A, %B %d, %Y %H:%M (local)')}."
+        f"Today is {now.strftime('%A, %B %d, %Y %H:%M UTC')}"
     )
 
     return "\n\n".join(prompt_parts)
@@ -303,8 +337,8 @@ def run_worker(
     """
     agent_id = agent_spec.id
     task_id = task.id
-    max_iterations = agent_spec.max_iterations or _DEFAULT_MAX_ITERATIONS
-    timeout = agent_spec.timeout_seconds or _DEFAULT_TIMEOUT_SECONDS
+    max_iterations = agent_spec.max_iterations or _default_max_iterations()
+    timeout = agent_spec.timeout_seconds or _default_timeout_seconds()
 
     _emit(event_callback, "worker_started", agent_id, task_id)
 
@@ -366,6 +400,8 @@ def run_worker(
 
     _KEEP_RECENT_TOOLS = 3
     data_tool_calls = 0
+    content_filter_count = 0
+    consecutive_content_filter_count = 0
 
     for iteration in range(max_iterations):
         # Microcompact: clear old tool results to prevent token bloat
@@ -391,6 +427,9 @@ def run_worker(
                 iterations=iteration,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
+                content_filter_warnings=compute_content_filter_warnings(
+                    content_filter_count, iteration + 1,
+                ),
             )
 
         # Check token estimate
@@ -407,6 +446,9 @@ def run_worker(
                 iterations=iteration,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
+                content_filter_warnings=compute_content_filter_warnings(
+                    content_filter_count, iteration + 1,
+                ),
             )
 
         # Inject wrap-up nudge when approaching iteration limit
@@ -428,8 +470,6 @@ def run_worker(
         # Stream the LLM — moonshot/kimi non-streaming invoke is unreliable
         # (issue #42), and streaming also feeds dashboard live progress.
         try:
-            remaining_timeout = max(10, int(timeout - elapsed))
-
             def _on_text_chunk(delta: str) -> None:
                 _emit(event_callback, "worker_text", agent_id, task_id,
                       {"content": delta, "iteration": iteration})
@@ -451,17 +491,54 @@ def run_worker(
                     {**payload, "iteration": iteration, "phase": "llm"},
                 )
 
-            with HeartbeatTimer(
-                tool_name=f"llm:{agent_spec.model_name or 'default'}",
-                interval=_HEARTBEAT_INTERVAL_S,
-                emit=_on_llm_heartbeat,
-            ):
-                response = llm.stream_chat(
-                    messages,
-                    tools=tool_defs,
-                    timeout=remaining_timeout,
-                    on_text_chunk=_on_text_chunk,
+            def _stream_once() -> LLMResponse:
+                """Run one heartbeat-wrapped streaming LLM call.
+
+                Recomputes the remaining time budget at call time so the
+                single retry after a stream failure never reuses a stale
+                timeout.
+
+                Returns:
+                    Parsed ``LLMResponse`` from ``ChatLLM.stream_chat``.
+
+                Raises:
+                    ProviderStreamError: When provider streaming fails.
+                """
+                remaining_timeout = max(10, int(timeout - (time.monotonic() - t0)))
+                with HeartbeatTimer(
+                    tool_name=f"llm:{agent_spec.model_name or 'default'}",
+                    interval=_HEARTBEAT_INTERVAL_S,
+                    emit=_on_llm_heartbeat,
+                ):
+                    return llm.stream_chat(
+                        messages,
+                        tools=tool_defs,
+                        timeout=remaining_timeout,
+                        on_text_chunk=_on_text_chunk,
+                    )
+
+            # A transient mid-stream hiccup (connection reset) used to be
+            # absorbed by ChatLLM's silent non-streaming fallback; it now
+            # surfaces as ProviderStreamError, so retry the stream exactly
+            # once before taking the existing failure path. Deterministic
+            # 4xx errors skip the retry and fail immediately.
+            try:
+                response = _stream_once()
+            except ProviderStreamError as stream_exc:
+                if not stream_exc.retryable:
+                    raise
+                logger.warning(
+                    "Provider stream failed for agent=%s task=%s iteration=%d "
+                    "(provider=%s model=%s); retrying once: %s",
+                    agent_id,
+                    task_id,
+                    iteration,
+                    stream_exc.provider,
+                    stream_exc.model,
+                    stream_exc,
                 )
+                time.sleep(_STREAM_RETRY_DELAY_S)
+                response = _stream_once()
         except Exception as exc:
             error_msg = f"LLM call failed at iteration {iteration}: {exc}"
             logger.warning(error_msg)
@@ -474,6 +551,9 @@ def run_worker(
                 error=error_msg,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
+                content_filter_warnings=compute_content_filter_warnings(
+                    content_filter_count, iteration + 1,
+                ),
             )
 
         # Accumulate token counts
@@ -484,6 +564,52 @@ def run_worker(
         # Track last meaningful assistant content
         if response.content and len(response.content.strip()) > 20:
             last_assistant_content = response.content
+
+        # Content-filter skip: provider blocked the response — continue to
+        # the next iteration instead of finalising on empty/garbage content.
+        if response.content_filter_triggered:
+            content_filter_count += 1
+            consecutive_content_filter_count += 1
+            if consecutive_content_filter_count >= MAX_CONSECUTIVE_CONTENT_FILTER_SKIPS:
+                _emit(
+                    event_callback,
+                    "content_filter_circuit_breaker",
+                    agent_id,
+                    task_id,
+                    {"count": content_filter_count},
+                )
+                summary = _resolve_summary(artifact_dir, last_assistant_content or "")
+                _write_summary(artifact_dir, summary)
+                return WorkerResult(
+                    status="failed",
+                    summary=summary,
+                    artifact_paths=_collect_artifacts(artifact_dir),
+                    iterations=iteration + 1,
+                    error=(
+                        f"content_filter_circuit_breaker: "
+                        f"{MAX_CONSECUTIVE_CONTENT_FILTER_SKIPS} consecutive "
+                        "LLM responses were blocked by content moderation"
+                    ),
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    content_filter_warnings=compute_content_filter_warnings(
+                        content_filter_count, iteration + 1,
+                    ),
+                )
+            _emit(
+                event_callback,
+                "content_filter_skipped",
+                agent_id,
+                task_id,
+                {"iteration": iteration, "content_filter_count": content_filter_count},
+            )
+            messages.append({
+                "role": "system",
+                "content": CONTENT_FILTER_SKIP_MESSAGE,
+            })
+            continue
+
+        consecutive_content_filter_count = 0
 
         # If no tool calls, this is the final response
         if not response.has_tool_calls:
@@ -507,6 +633,9 @@ def run_worker(
                     error=f"output contract not met: {reason}",
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
+                    content_filter_warnings=compute_content_filter_warnings(
+                        content_filter_count, iteration + 1,
+                    ),
                 )
             _emit(event_callback, "worker_completed", agent_id, task_id, {"iterations": iteration + 1})
             return WorkerResult(
@@ -516,6 +645,9 @@ def run_worker(
                 iterations=iteration + 1,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
+                content_filter_warnings=compute_content_filter_warnings(
+                    content_filter_count, iteration + 1,
+                ),
             )
 
         # Append assistant message with tool calls
@@ -558,19 +690,32 @@ def run_worker(
                 emit=_on_heartbeat,
             ):
                 result = registry.execute(tc.name, args)
-            if tc.name != "load_skill" and not _is_error_result(result):
+            result_is_error = _is_error_result(result)
+            if tc.name != "load_skill" and not result_is_error:
                 data_tool_calls += 1
             tc_elapsed = time.monotonic() - tc_start
             _emit(
-                event_callback, "tool_result", agent_id, task_id,
-                {"tool": tc.name, "elapsed_ms": int(tc_elapsed * 1000),
-                 "status": "ok", "iteration": iteration,
-                  "result_preview": _preview_tool_result(result),
-                 **mcp_meta},
+                event_callback,
+                "tool_result",
+                agent_id,
+                task_id,
+                {
+                    "tool": tc.name,
+                    "elapsed_ms": int(tc_elapsed * 1000),
+                    "status": "error" if result_is_error else "ok",
+                    "iteration": iteration,
+                    "result_preview": _preview_tool_result(result),
+                    **mcp_meta,
+                },
             )
             messages.append(
                 ContextBuilder.format_tool_result(tc.id, tc.name, result[:10_000])
             )
+
+    # Content filter ratio tracking
+    content_filter_warnings = compute_content_filter_warnings(
+        content_filter_count, iteration + 1,
+    )
 
     # Hit iteration limit — use last meaningful content as summary
     summary = _best_summary(messages, last_assistant_content) or f"Worker hit iteration limit ({max_iterations} iterations)"
@@ -594,6 +739,7 @@ def run_worker(
             error=f"hit iteration limit without a valid deliverable: {reason}",
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
+            content_filter_warnings=content_filter_warnings,
         )
     _emit(event_callback, "worker_iteration_limit", agent_id, task_id)
     return WorkerResult(
@@ -603,6 +749,7 @@ def run_worker(
         iterations=max_iterations,
         input_tokens=total_input_tokens,
         output_tokens=total_output_tokens,
+        content_filter_warnings=content_filter_warnings,
     )
 
 
@@ -810,14 +957,34 @@ def _write_summary(artifact_dir: Path, summary: str) -> None:
 
 
 def _collect_artifacts(artifact_dir: Path) -> list[str]:
-    """Collect all artifact file paths from agent's artifact directory.
+    """Collect regular artifacts as deterministic run-relative paths.
 
     Args:
         artifact_dir: Path to artifacts/{agent_id}/ directory.
 
     Returns:
-        List of artifact file path strings.
+        Sorted POSIX-style paths relative to the swarm run directory. Symlinks
+        and files that resolve outside the agent artifact directory are omitted.
     """
     if not artifact_dir.exists():
         return []
-    return [str(p) for p in artifact_dir.iterdir() if p.is_file()]
+
+    run_dir = artifact_dir.parent.parent.resolve()
+    artifact_root = artifact_dir.resolve()
+    if not artifact_root.is_relative_to(run_dir):
+        return []
+
+    artifacts: list[str] = []
+    for path in artifact_dir.rglob("*"):
+        try:
+            if path.is_symlink():
+                continue
+            resolved = path.resolve(strict=True)
+            if not resolved.is_relative_to(artifact_root) or not resolved.is_file():
+                continue
+            artifacts.append(resolved.relative_to(run_dir).as_posix())
+        except (OSError, RuntimeError, ValueError):
+            # A concurrently removed file, symlink loop, or containment
+            # failure is not a durable artifact and must not escape the run.
+            continue
+    return sorted(artifacts)

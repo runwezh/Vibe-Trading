@@ -122,6 +122,40 @@ describe("useSSE — event handling", () => {
     expect(textDeltas[0]).toEqual({ content: "hello" });
   });
 
+  it("dispatches reasoning progress events", () => {
+    const reasoningEvents: unknown[] = [];
+    const { result } = renderHook(() => useSSE());
+
+    act(() =>
+      result.current.connect("http://test/events", {
+        reasoning_delta: (data) => reasoningEvents.push(data),
+      }),
+    );
+
+    act(() => MockEventSource.latest.emit("reasoning_delta", { chars: 8 }, "evt-reasoning"));
+    expect(reasoningEvents).toEqual([{ chars: 8 }]);
+  });
+
+  it("dispatches stream reset events", () => {
+    const resetEvents: unknown[] = [];
+    const { result } = renderHook(() => useSSE());
+
+    act(() =>
+      result.current.connect("http://test/events", {
+        stream_reset: (data) => resetEvents.push(data),
+      }),
+    );
+
+    act(() =>
+      MockEventSource.latest.emit(
+        "stream_reset",
+        { reason: "provider_stream_retry" },
+        "evt-reset",
+      ),
+    );
+    expect(resetEvents).toEqual([{ reason: "provider_stream_retry" }]);
+  });
+
   it("falls back to message handler for known event types without specific handler", () => {
     const messages: unknown[] = [];
     const { result } = renderHook(() => useSSE());
@@ -274,5 +308,90 @@ describe("useSSE — Last-Event-ID resume", () => {
     // The new EventSource should have Last-Event-ID in the URL
     const newUrl = MockEventSource.latest.url;
     expect(newUrl).toContain("Last-Event-ID=resume-42");
+  });
+});
+
+describe("useSSE — SSE ticket auth (VT-003)", () => {
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  it("stays synchronous and mints no ticket in dev mode (no stored key)", () => {
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const { result } = renderHook(() => useSSE());
+    act(() => result.current.connect("http://test/events", {}));
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(MockEventSource.instances).toHaveLength(1);
+    expect(MockEventSource.latest.url).toBe("http://test/events");
+  });
+
+  it("mints a single-use ticket and opens the stream with ?ticket= when a key is stored", async () => {
+    localStorage.setItem("vibe_trading_api_auth_key", "remote-key");
+    const fetchSpy = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ticket: "SSE-TICKET" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const { result } = renderHook(() => useSSE());
+    await act(async () => {
+      result.current.connect("http://test/events", {});
+      // Flush the ticket-fetch promise chain before the EventSource is opened.
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "/auth/sse-ticket",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(MockEventSource.instances).toHaveLength(1);
+    expect(MockEventSource.latest.url).toContain("ticket=SSE-TICKET");
+    // The long-lived key must never appear in the stream URL.
+    expect(MockEventSource.latest.url).not.toContain("remote-key");
+  });
+
+  it("ignores a ticket that resolves after a newer connection", async () => {
+    localStorage.setItem("vibe_trading_api_auth_key", "remote-key");
+    const ticketResolvers: Array<(response: Response) => void> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        () =>
+          new Promise<Response>((resolve) => {
+            ticketResolvers.push(resolve);
+          }),
+      ),
+    );
+
+    const { result } = renderHook(() => useSSE());
+    act(() => {
+      result.current.connect("http://test/session-a/events", {});
+      result.current.connect("http://test/session-b/events", {});
+    });
+
+    await act(async () => {
+      ticketResolvers[1](
+        new Response(JSON.stringify({ ticket: "TICKET-B" }), { status: 200 }),
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      ticketResolvers[0](
+        new Response(JSON.stringify({ ticket: "TICKET-A" }), { status: 200 }),
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(MockEventSource.instances).toHaveLength(1);
+    expect(MockEventSource.latest.url).toContain("session-b/events");
+    expect(MockEventSource.latest.url).toContain("ticket=TICKET-B");
   });
 });

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from urllib.parse import urlparse
 import re
 from collections.abc import Sequence
 from importlib import import_module
@@ -448,13 +449,138 @@ def _build_native_deepseek(
     )
 
 
+# Anthropic model names discovered at runtime to reject the `temperature`
+# request field. Next-gen Claude models (e.g. claude-opus-5, claude-opus-4-8,
+# claude-sonnet-5) return HTTP 400 "`temperature` is deprecated for this model."
+# for ANY temperature value, while older models (claude-opus-4-5,
+# claude-sonnet-4-5, …) still honor it. Model names are not reliably
+# predictable, so membership is populated on first failure and then reused
+# process-wide to skip the redundant failed request on subsequent calls.
+_ANTHROPIC_TEMPERATURE_UNSUPPORTED: set[str] = set()
+
+# Cache of base ChatAnthropic class -> temperature-safe subclass, so the dynamic
+# subclass is built once per resolved base class (keyed to support test doubles).
+_TEMPERATURE_SAFE_ANTHROPIC_CACHE: dict[type, type] = {}
+
+
+def _is_anthropic_temperature_unsupported_error(exc: BaseException) -> bool:
+    """Return True when an Anthropic error reports `temperature` as unsupported.
+
+    Matches the model-level deprecation ("`temperature` is deprecated for this
+    model.") regardless of the SDK exception type or the temperature value sent.
+    """
+    message = str(getattr(exc, "message", "") or exc).lower()
+    if "temperature" not in message:
+        return False
+    return (
+        "deprecated" in message
+        or "not supported" in message
+        or "unsupported" in message
+        or "not allowed" in message
+    )
+
+
+def _make_temperature_safe_anthropic(base_cls: type) -> type:
+    """Build (and cache) a ChatAnthropic subclass that self-heals temperature.
+
+    Certain Claude models reject the `temperature` field entirely. This subclass
+    transparently drops `temperature` from the request and retries once when the
+    API reports it as unsupported, remembering the model in
+    ``_ANTHROPIC_TEMPERATURE_UNSUPPORTED`` so later requests omit it up front.
+    Models that accept `temperature` are unaffected — their configured value
+    (e.g. the deterministic 0.0 default) is preserved.
+
+    Built from the class resolved at call time so the optional
+    ``langchain-anthropic`` dependency stays lazily imported and test doubles
+    still work.
+    """
+    cached = _TEMPERATURE_SAFE_ANTHROPIC_CACHE.get(base_cls)
+    if cached is not None:
+        return cached
+
+    def _get_request_payload(self: Any, *args: Any, **kwargs: Any) -> dict:
+        payload = base_cls._get_request_payload(self, *args, **kwargs)
+        if isinstance(payload, dict) and self.model in _ANTHROPIC_TEMPERATURE_UNSUPPORTED:
+            payload.pop("temperature", None)
+        return payload
+
+    def _remember_and_should_retry(self: Any, exc: BaseException) -> bool:
+        if _is_anthropic_temperature_unsupported_error(exc):
+            if self.model not in _ANTHROPIC_TEMPERATURE_UNSUPPORTED:
+                logger.info(
+                    "Anthropic model %s rejects `temperature`; retrying without it "
+                    "and omitting it for subsequent calls.",
+                    self.model,
+                )
+                _ANTHROPIC_TEMPERATURE_UNSUPPORTED.add(self.model)
+                return True
+        return False
+
+    def _generate(self: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return base_cls._generate(self, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - retried or re-raised below
+            if _remember_and_should_retry(self, exc):
+                return base_cls._generate(self, *args, **kwargs)
+            raise
+
+    async def _agenerate(self: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return await base_cls._agenerate(self, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - retried or re-raised below
+            if _remember_and_should_retry(self, exc):
+                return await base_cls._agenerate(self, *args, **kwargs)
+            raise
+
+    def _stream(self: Any, *args: Any, **kwargs: Any) -> Any:
+        # The temperature-unsupported error is raised before the first chunk is
+        # produced, so retrying the whole stream cannot duplicate output.
+        try:
+            yield from base_cls._stream(self, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - retried or re-raised below
+            if _remember_and_should_retry(self, exc):
+                yield from base_cls._stream(self, *args, **kwargs)
+            else:
+                raise
+
+    async def _astream(self: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            async for chunk in base_cls._astream(self, *args, **kwargs):
+                yield chunk
+        except Exception as exc:  # noqa: BLE001 - retried or re-raised below
+            if _remember_and_should_retry(self, exc):
+                async for chunk in base_cls._astream(self, *args, **kwargs):
+                    yield chunk
+            else:
+                raise
+
+    safe_cls = type(
+        "ChatAnthropicTemperatureSafe",
+        (base_cls,),
+        {
+            "_get_request_payload": _get_request_payload,
+            "_generate": _generate,
+            "_agenerate": _agenerate,
+            "_stream": _stream,
+            "_astream": _astream,
+        },
+    )
+    _TEMPERATURE_SAFE_ANTHROPIC_CACHE[base_cls] = safe_cls
+    return safe_cls
+
+
 def _build_anthropic(
     *,
     model: str,
     temperature: float,
     callbacks: Any = None,
 ) -> Any:
-    """Build the native Anthropic Messages API adapter."""
+    """Build the native Anthropic Messages API adapter.
+
+    Uses a temperature-safe subclass so models that deprecate the `temperature`
+    field (e.g. claude-opus-5 / claude-sonnet-5) work transparently while models
+    that still accept it keep the configured deterministic value.
+    """
     try:
         module = import_module("langchain_anthropic")
         chat_anthropic = getattr(module, "ChatAnthropic")
@@ -464,7 +590,8 @@ def _build_anthropic(
             'extra: pip install "vibe-trading-ai[anthropic]" (or pip install langchain-anthropic).'
         ) from exc
 
-    return chat_anthropic(
+    safe_anthropic = _make_temperature_safe_anthropic(chat_anthropic)
+    return safe_anthropic(
         model=model,
         max_tokens=get_env_config().llm.anthropic_max_tokens,
         temperature=temperature,
@@ -569,6 +696,48 @@ def _sync_provider_env() -> None:
         os.environ["OPENAI_BASE_URL"] = base_url
 
 
+def _supports_top_level_reasoning_effort(provider: str, caps_name: str) -> bool:
+    """Report whether a provider accepts a top-level ``reasoning_effort`` field.
+
+    Direct OpenAI is the only verified consumer: its ``gpt-5.6-*`` models reject
+    function tools on ``/v1/chat/completions`` unless the request carries an
+    explicit ``reasoning_effort`` — including the literal ``"none"``. Every other
+    OpenAI-compatible provider (DeepSeek, Gemini, Groq, DashScope/Qwen, Zhipu,
+    NVIDIA, Spark, MiniMax, …) may reject the unknown field, so this is a
+    positive allowlist, never "everything without ``openrouter_reasoning_body``".
+    Relays that take the field inside ``extra_body.reasoning`` (OpenRouter,
+    Requesty) keep that path and are excluded here.
+
+    Args:
+        provider: Configured ``LANGCHAIN_PROVIDER`` value.
+        caps_name: Canonical capability name resolved for the provider/model.
+
+    Returns:
+        True only for direct OpenAI. The configured name is checked alongside the
+        resolved capability because unknown provider names fall back to OpenAI
+        capabilities — an unverified gateway must not inherit the field — while
+        the capability name check drops model-inferred providers (e.g. provider
+        ``openai`` with a ``deepseek-*`` model resolves to DeepSeek).
+    """
+    if caps_name != "openai" or provider.strip().lower() not in {"", "openai"}:
+        return False
+    # A base-URL override points the OpenAI client at some other gateway
+    # (Ollama, LiteLLM, a corporate proxy). Those speak the OpenAI wire format
+    # but need not accept this field, so the label alone is not enough.
+    try:
+        base_url = (
+            get_llm_credentials("openai", get_env_config().llm.langchain_model_name)
+            .get("base_url")
+            or ""
+        ).strip()
+    except Exception:  # noqa: BLE001 - a credential lookup must not break the check
+        return False
+    if not base_url:
+        return True
+    host = urlparse(base_url if "//" in base_url else f"https://{base_url}").hostname or ""
+    return host.lower() in {"api.openai.com", "openai.com"}
+
+
 def provider_diagnostics() -> dict[str, Any]:
     """Build a redacted provider diagnostic snapshot.
 
@@ -664,6 +833,9 @@ def provider_diagnostics() -> dict[str, Any]:
             "send_reasoning_content": caps.send_reasoning_content,
             "gemini_thought_signatures": caps.gemini_thought_signatures,
             "openrouter_reasoning_body": caps.openrouter_reasoning_body,
+            "top_level_reasoning_effort": _supports_top_level_reasoning_effort(
+                provider, caps.name
+            ),
         },
     }
 
@@ -748,6 +920,15 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
         "extra_body": (
             {"reasoning": {"effort": effort}}
             if effort and caps.openrouter_reasoning_body
+            else None
+        ),
+        # Direct OpenAI takes the effort as a top-level request field instead
+        # (gpt-5.6-* require it, even "none", to accept function tools).
+        # None is dropped by langchain-openai, so unsupported providers keep a
+        # payload without the field.
+        "reasoning_effort": (
+            effort
+            if effort and _supports_top_level_reasoning_effort(provider, caps.name)
             else None
         ),
         "vibe_provider": provider,

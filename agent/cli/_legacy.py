@@ -51,13 +51,22 @@ from rich.text import Text
 
 from cli.theme import get_console
 from src.config.accessor import get_env_config, reset_env_config
+from src.config.paths import (
+    get_runs_dir,
+    get_runtime_root,
+    get_sessions_dir,
+    get_swarm_runs_dir,
+    get_uploads_dir,
+)
 
 console = get_console()
+# AGENT_DIR is a code location (frontend defaults, dev-server cwd). State
+# lives under the user-level runtime root, never relative to the code (#904).
 AGENT_DIR = Path(__file__).resolve().parents[1]
-RUNS_DIR = AGENT_DIR / "runs"
-SWARM_DIR = AGENT_DIR / ".swarm" / "runs"
-SESSIONS_DIR = AGENT_DIR / "sessions"
-UPLOADS_DIR = AGENT_DIR / "uploads"
+RUNS_DIR = get_runs_dir()
+SWARM_DIR = get_swarm_runs_dir()
+SESSIONS_DIR = get_sessions_dir()
+UPLOADS_DIR = get_uploads_dir()
 
 EXIT_SUCCESS = 0
 EXIT_RUN_FAILED = 1
@@ -387,7 +396,7 @@ def _terminal_width() -> int:
 
 
 def _ensure_cli_env() -> None:
-    """Load dotenv values before rendering CLI-only settings."""
+    """Load dotenv values before a CLI path reads configuration."""
     try:
         from src.providers.llm import _ensure_dotenv
 
@@ -979,6 +988,50 @@ def _mandate_proposal_from_tool_result(data: Dict[str, Any]) -> Optional[Dict[st
     return _load_full_proposal(match.group(1))
 
 
+def _ensure_session_id(title: str, *, session_id: Optional[str] = None) -> str:
+    """Return a host-owned session id, registering the session record if new.
+
+    The research-goal tools are registered unconditionally and resolve their
+    session from the host runtime, so any entry point that calls
+    :func:`_run_agent` without an id makes every goal call fail validation with
+    ``session_id is required`` while the run still reports success (#885).
+
+    Persistence is best effort. ``Session`` populates ``session_id`` on
+    construction, so a store or index failure still yields a usable id rather
+    than falling back to the empty string that caused the bug.
+
+    Args:
+        title: Text used as the session title; truncated for display.
+        session_id: Explicit id to register, for callers that need the same
+            session across repeated invocations. Defaults to a fresh id.
+
+    Returns:
+        A non-empty session id.
+    """
+    from src.session.models import Session, SessionStatus
+    from src.session.store import SessionStore
+
+    session = Session(
+        title=title.strip()[:60] or "untitled",
+        status=SessionStatus.ACTIVE,
+    )
+    if session_id:
+        session.session_id = session_id
+    try:
+        SessionStore(base_dir=SESSIONS_DIR).create_session(session)
+    except Exception:  # noqa: BLE001 — an existing or unwritable session must not block the run
+        return session.session_id
+
+    # Index for FTS5 cross-session search, mirroring the interactive REPL.
+    try:
+        from src.session.search import get_shared_index
+
+        get_shared_index().index_session(session.session_id, session.title)
+    except Exception:  # noqa: BLE001 — search index is optional
+        pass
+    return session.session_id
+
+
 def _run_agent(
     prompt: str,
     history: Optional[List[Dict]] = None,
@@ -1417,14 +1470,23 @@ def cmd_run(prompt: str, max_iter: int, *, json_mode: bool = False, no_rich: boo
         else:
             console.print(f"[dim]Prompt:[/dim] {preview}{suffix}\n")
     start = time.perf_counter()
+    session_id = _ensure_session_id(prompt)
     try:
         if json_mode or no_rich:
-            result = _run_agent(prompt, max_iter=max_iter, no_rich=no_rich, stream_output=not json_mode)
+            result = _run_agent(
+                prompt,
+                max_iter=max_iter,
+                no_rich=no_rich,
+                stream_output=not json_mode,
+                session_id=session_id,
+            )
         else:
             dashboard = _RunDashboard(prompt, max_iter)
             with Live(dashboard.render(), console=console, refresh_per_second=6, transient=True) as live:
                 dashboard.live = live
-                result = _run_agent(prompt, max_iter=max_iter, dashboard=dashboard)
+                result = _run_agent(
+                    prompt, max_iter=max_iter, dashboard=dashboard, session_id=session_id
+                )
                 dashboard.finish(result, time.perf_counter() - start)
     except KeyboardInterrupt:
         if json_mode:
@@ -1498,6 +1560,13 @@ def cmd_continue(
     trace_dir.mkdir(parents=True, exist_ok=True)
 
     history = _build_history_from_trace(trace_dir)
+    # Continuations of one run share a session so goals and evidence accumulate
+    # across them. A session-backed run_id already *is* a session id (sessions
+    # and their traces share ``SESSIONS_DIR``); a plain run gets a derived id.
+    session_id = _ensure_session_id(
+        prompt,
+        session_id=run_id if session_trace_dir.exists() else f"run-{run_id}",
+    )
     if not json_mode and no_rich:
         print(f"Continue {run_id}: {prompt[:120]}\n")
     if json_mode or no_rich:
@@ -1510,6 +1579,7 @@ def cmd_continue(
                 max_iter=max_iter,
                 no_rich=no_rich,
                 stream_output=not json_mode,
+                session_id=session_id,
             )
         except KeyboardInterrupt:
             if json_mode:
@@ -1542,6 +1612,7 @@ def cmd_continue(
                 run_dir_override=str(trace_dir),
                 max_iter=max_iter,
                 dashboard=dashboard,
+                session_id=session_id,
             )
             dashboard.finish(result, time.perf_counter() - start)
     except KeyboardInterrupt:
@@ -1598,7 +1669,7 @@ def _build_welcome_panel(term_width: Optional[int] = None) -> Panel:
             ("Credential", key_state, "bold green" if credential_ready else "bold yellow"),
             ("Runs", str(recent_runs), "cyan"),
             ("Swarms", str(recent_swarms), "cyan"),
-            ("Workspace", str(AGENT_DIR), "dim"),
+            ("Workspace", str(get_runtime_root()), "dim"),
         ]
         for label, value, value_style in rows:
             config_lines.append(
@@ -1615,7 +1686,7 @@ def _build_welcome_panel(term_width: Optional[int] = None) -> Panel:
         rows = [
             ("Provider", str(provider), "bold cyan", "Credential", key_state, "bold green" if credential_ready else "bold yellow"),
             ("Model", str(model), "white", "Runs", str(recent_runs), "cyan"),
-            ("Workspace", str(AGENT_DIR), "dim", "Swarms", str(recent_swarms), "cyan"),
+            ("Workspace", str(get_runtime_root()), "dim", "Swarms", str(recent_swarms), "cyan"),
         ]
         for left_label, left_value, left_style, right_label, right_value, right_style in rows:
             config_lines.append(
@@ -1910,6 +1981,9 @@ def cmd_interactive(max_iter: int) -> None:
     history: List[Dict[str, str]] = []
     stats = _SessionStats(session_start=time.monotonic())
     prompt_session = _create_prompt_session(stats)
+    # Created on the first agent turn so a REPL used only for slash commands
+    # leaves no empty session behind.
+    session_id = ""
 
     while True:
         if prompt_session is None:
@@ -1934,11 +2008,19 @@ def cmd_interactive(max_iter: int) -> None:
 
         # Natural language -> agent
         start = time.perf_counter()
+        if not session_id:
+            session_id = _ensure_session_id(user_input)
         try:
             dashboard = _RunDashboard(user_input, max_iter)
             with Live(dashboard.render(), console=console, refresh_per_second=6, transient=True) as live:
                 dashboard.live = live
-                result = _run_agent(user_input, history=history[-6:], max_iter=max_iter, dashboard=dashboard)
+                result = _run_agent(
+                    user_input,
+                    history=history[-6:],
+                    max_iter=max_iter,
+                    dashboard=dashboard,
+                    session_id=session_id,
+                )
                 dashboard.finish(result, time.perf_counter() - start)
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted[/yellow]")
@@ -2738,7 +2820,9 @@ def cmd_session_chat(session_id: str, max_iter: int) -> None:
             _timer = threading.Thread(target=_session_event_timer, args=(spinner,), daemon=True)
             _timer.start()
             try:
-                result = _run_agent(prompt, history=history[-6:], max_iter=max_iter)
+                result = _run_agent(
+                    prompt, history=history[-6:], max_iter=max_iter, session_id=session_id
+                )
             except KeyboardInterrupt:
                 console.print("\n[yellow]Interrupted[/yellow]")
                 continue
@@ -4438,6 +4522,7 @@ def cmd_connector_revoke(profile_id: Optional[str]) -> int:
 
 def _dispatch_connector(args: argparse.Namespace) -> int:
     """Route parsed ``connector`` subcommands."""
+    _ensure_cli_env()
     sub = getattr(args, "connector_command", None)
     if sub == "list":
         return cmd_connector_list()

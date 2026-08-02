@@ -216,13 +216,7 @@ def _check_tushare() -> CheckResult:
 
 
 def _check_akshare() -> CheckResult:
-    """Check akshare availability.
-
-    6.2 Hermes patch: in mainland China, East Money scraper is throttled and
-    akshare network calls fail at runtime. Probe eastmoney.com connectivity;
-    if unreachable, downgrade to 'degraded' so users know the data source is
-    throttled but the package itself is installed.
-    """
+    """Check akshare availability."""
     if find_spec("akshare") is None:
         return CheckResult(
             name="akshare",
@@ -230,19 +224,7 @@ def _check_akshare() -> CheckResult:
             message="package not installed",
             impact="A-share/forex fallback unavailable",
         )
-    # Probe East Money (akshare's primary data source)
-    try:
-        import socket
-        socket.setdefaulttimeout(2.0)
-        socket.create_connection(("push2.eastmoney.com", 443), timeout=2.0).close()
-        return CheckResult(name="akshare", status="ready", message="installed", impact="")
-    except (OSError, socket.timeout):
-        return CheckResult(
-            name="akshare",
-            status="ready",  # still 'ready' because package is installed
-            message="installed (East Money throttled - fallback to tushare/mootdx)",
-            impact="A-share live data via akshare will fail at runtime; use tushare/mootdx",
-        )
+    return CheckResult(name="akshare", status="ready", message="installed", impact="")
 
 
 def _check_content_filter_threshold() -> CheckResult:

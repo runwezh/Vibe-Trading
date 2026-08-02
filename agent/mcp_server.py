@@ -6,7 +6,7 @@ Zero API key required for HK/US/crypto research markets (yfinance, OKX,
 AKShare are free). Trading connector tools are profile-scoped and require the
 selected connector's own local app or OAuth setup.
 
-Surfaces 54 tools: skills, research goals, backtest/factor/options/pattern
+Surfaces 55 tools: skills, research goals, backtest/factor/options/pattern
 analysis, market data, fundamentals & capital-flow & news & discovery
 (get_fund_flow / get_dragon_tiger / get_northbound_flow / get_margin_trading /
 get_block_trades / get_shareholder_count / get_lockup_expiry / get_sector_info /
@@ -59,41 +59,6 @@ AGENT_DIR = Path(__file__).resolve().parent
 if str(AGENT_DIR) not in sys.path:
     sys.path.insert(0, str(AGENT_DIR))
 
-
-def _load_runtime_env() -> None:
-    """Load TUSHARE_TOKEN (and other runtime vars) from the project-local .env.
-
-    The MCP server is spawned as a child process by the Hermes gateway
-    (see ``mcp_servers.vibe-trading`` in ``~/.hermes/config.yaml``). The
-    child inherits the parent env, but ``mcp_servers.*.env`` only
-    forwards an explicit allowlist — TUSHARE_TOKEN is not in that
-    allowlist, so the child sees an empty TUSHARE_TOKEN and the tushare
-    loader's ``is_available()`` returns False. This forces the
-    fallback chain to mootdx → akshare, which is broken in mainland
-    China (East Money throttled). The result: ``get_market_data``
-    returns noisy cache fragments, not live A-share prices.
-
-    We work around the missing allowlist entry by loading the project
-    ``agent/.env`` directly here. ``override=False`` keeps any explicit
-    gateway-forwarded variable (so this never silently overwrites a
-    real secret) and the loader is a no-op when python-dotenv is not
-    installed (e.g. minimal dev venv).
-
-    Path follows the project convention used by ``agent/scripts/w4a_run_benches.py``
-    (``load_dotenv(AGENT_DIR / ".env")``); the file itself is gitignored
-    via ``agent/.gitignore`` and seeded from ``agent/.env.example``.
-    """
-    try:
-        from dotenv import load_dotenv  # type: ignore
-    except ImportError:
-        return
-    project_env = AGENT_DIR / ".env"
-    if project_env.exists():
-        load_dotenv(project_env, override=False)
-
-
-_load_runtime_env()
-
 from fastmcp import Context, FastMCP
 from cli._version import __version__ as APP_VERSION
 from src.market_data import (
@@ -116,8 +81,8 @@ logger = logging.getLogger(__name__)
 _skills_loader = None
 _registry = None
 _goal_store = None
-# Fail-closed default: the bash / background_run shell tools are a remote
-# code-execution surface once the MCP server is reachable by any client (stdio,
+# Fail-closed default: bash / background_run / cancel_background form a remote
+# process-control surface once the MCP server is reachable by any client (stdio,
 # SSE, or Streamable HTTP), so they stay OFF unless an operator explicitly opts
 # in. main() may flip this on via --enable-shell-tools or the
 # VIBE_TRADING_ENABLE_SHELL_TOOLS env var. Keeping the module-level default off
@@ -135,11 +100,12 @@ def _env_shell_tools_enabled() -> bool:
 def _resolve_include_shell_tools(cli_opt_in: bool) -> bool:
     """Resolve whether the MCP server should register shell tools.
 
-    Shell tools (``bash`` / ``background_run``) run arbitrary OS commands and are
-    an RCE surface regardless of transport. They are therefore disabled for every
-    transport unless the operator explicitly opts in. Transport type never
-    implicitly grants shell access: previously ``stdio`` force-enabled these tools
-    with no opt-out (GHSA-6wjh-cc6v-xfrx), which also widened the reachable
+    Process-control tools (``bash`` / ``background_run`` /
+    ``cancel_background``) run commands or terminate tracked command trees and
+    are an RCE surface regardless of transport. They are therefore disabled for
+    every transport unless the operator explicitly opts in. Transport type never
+    implicitly grants shell access: previously ``stdio`` force-enabled these
+    tools with no opt-out (GHSA-6wjh-cc6v-xfrx), which also widened the reachable
     surface of the ``bash`` OS-command-injection issue (GHSA-m768-22r9-h4x7).
 
     Args:
@@ -369,6 +335,36 @@ def _get_goal_store():
     return _goal_store
 
 
+_mcp_session_id: str | None = None
+
+
+def _resolve_session_id(session_id: str = "") -> str:
+    """Resolve the goal session, defaulting to this server process's session.
+
+    The in-process tool registry injects the host session and keeps
+    ``session_id`` out of its required schema. MCP has no such injection point,
+    so these tools used to mark the id required — asking the model to invent an
+    internal identifier it has no way to know, the opposite contract from the
+    local path (#885). Default instead to one stable id per server process,
+    which is the closest MCP equivalent of a host-owned session, while still
+    honouring an explicit id from a client that tracks its own conversations.
+
+    Args:
+        session_id: Optional client-supplied session id.
+
+    Returns:
+        A non-empty session id.
+    """
+    global _mcp_session_id
+    if cleaned := session_id.strip():
+        return cleaned
+    if _mcp_session_id is None:
+        import uuid
+
+        _mcp_session_id = f"mcp-{uuid.uuid4().hex[:12]}"
+    return _mcp_session_id
+
+
 def _json_ok(**payload: Any) -> str:
     """Return a standard MCP JSON success envelope."""
     return json.dumps({"status": "ok", **payload}, ensure_ascii=False, indent=2)
@@ -476,8 +472,8 @@ def load_skill(name: str) -> str:
 
 @mcp.tool
 def start_research_goal(
-    session_id: str,
     objective: str,
+    session_id: str = "",
     criteria: list[str] | None = None,
     ui_summary: str = "",
     protocol: str = "thesis_review",
@@ -493,8 +489,9 @@ def start_research_goal(
     previous current goal for the same session.
 
     Args:
-        session_id: External conversation/session id owned by the MCP client.
         objective: Research-only objective, not a trade execution request.
+        session_id: Optional conversation id. Omit it unless the client tracks
+            its own sessions; this server then uses one id per process.
         criteria: Optional checklist. Defaults to the MVP finance protocol.
         ui_summary: Optional compact label for UI surfaces.
         protocol: Research protocol name. Defaults to thesis_review.
@@ -506,7 +503,7 @@ def start_research_goal(
     try:
         clean_criteria = _clean_list(criteria) or _default_goal_criteria()
         goal = _get_goal_store().replace_goal(
-            session_id=session_id.strip(),
+            session_id=_resolve_session_id(session_id),
             objective=objective,
             criteria=clean_criteria,
             ui_summary=ui_summary,
@@ -524,14 +521,15 @@ def start_research_goal(
 
 
 @mcp.tool
-def get_research_goal(session_id: str) -> str:
+def get_research_goal(session_id: str = "") -> str:
     """Return the current finance research goal snapshot for a session.
 
     Args:
-        session_id: External conversation/session id owned by the MCP client.
+        session_id: Optional conversation id. Omit it unless the client tracks
+            its own sessions; this server then uses one id per process.
     """
     try:
-        snapshot = _get_goal_store().get_current_snapshot(session_id.strip())
+        snapshot = _get_goal_store().get_current_snapshot(_resolve_session_id(session_id))
     except ValueError as exc:
         return _json_error(str(exc), error_type="validation")
     if snapshot is None:
@@ -541,10 +539,10 @@ def get_research_goal(session_id: str) -> str:
 
 @mcp.tool
 def add_goal_evidence(
-    session_id: str,
     goal_id: str,
     expected_goal_id: str,
     text: str,
+    session_id: str = "",
     criterion_id: str | None = None,
     claim_id: str | None = None,
     evidence_type: str = "evidence",
@@ -568,10 +566,11 @@ def add_goal_evidence(
     """Append traceable evidence to a finance research goal.
 
     Args:
-        session_id: External conversation/session id.
         goal_id: Goal being mutated.
         expected_goal_id: Goal id captured before the tool/model turn started.
         text: Evidence note or result summary.
+        session_id: Optional conversation id. Omit it unless the client tracks
+            its own sessions; this server then uses one id per process.
         criterion_id: Optional criterion this evidence satisfies.
         claim_id: Optional claim this evidence supports or contradicts.
         evidence_type: Evidence category, default evidence.
@@ -596,7 +595,7 @@ def add_goal_evidence(
         from src.goal import EvidenceInput, StaleGoalError
 
         evidence = _get_goal_store().append_evidence(
-            session_id=session_id.strip(),
+            session_id=_resolve_session_id(session_id),
             goal_id=goal_id.strip(),
             expected_goal_id=expected_goal_id.strip(),
             evidence=EvidenceInput(
@@ -636,10 +635,10 @@ def add_goal_evidence(
 
 @mcp.tool
 def update_research_goal_status(
-    session_id: str,
     goal_id: str,
     expected_goal_id: str,
     status: str,
+    session_id: str = "",
     audit: list[dict[str, Any]] | None = None,
     recap: str | None = None,
 ) -> str:
@@ -650,10 +649,11 @@ def update_research_goal_status(
     required criterion and verified evidence for satisfied rows.
 
     Args:
-        session_id: External conversation/session id.
         goal_id: Goal being mutated.
         expected_goal_id: Goal id captured before the tool/model turn started.
         status: Goal lifecycle status, e.g. complete, cancelled, blocked.
+        session_id: Optional conversation id. Omit it unless the client tracks
+            its own sessions; this server then uses one id per process.
         audit: Optional list of criterion audit rows.
         recap: Optional concise status recap.
     """
@@ -661,7 +661,7 @@ def update_research_goal_status(
         from src.goal import GoalStatus, StaleGoalError
 
         updated = _get_goal_store().update_status(
-            session_id=session_id.strip(),
+            session_id=_resolve_session_id(session_id),
             goal_id=goal_id.strip(),
             expected_goal_id=expected_goal_id.strip(),
             status=GoalStatus(status),
@@ -780,6 +780,64 @@ def analyze_options(
             "option_type": option_type,
         },
     )
+
+
+@mcp.tool
+def analyze_options_payoff(
+    legs: list[dict[str, Any]],
+    entry_spot: float,
+    expiry_days: float,
+    risk_free_rate: float = 0.05,
+    volatility: float = 0.3,
+    multiplier: float = 1.0,
+    commission_rate: float = 0.001,
+    spot_min: float | None = None,
+    spot_max: float | None = None,
+    spot_points: int = 121,
+    scenario_iv_values: list[float] | None = None,
+) -> str:
+    """Analyze a multi-leg option strategy's payoff and spot/IV scenarios.
+
+    The expiry summary is analytic rather than chart-grid dependent. Returns
+    entry debit/credit and commission, breakevens, bounded or unbounded maximum
+    profit/loss, an expiry curve, and a Black-Scholes spot/IV P&L matrix.
+    Research only; this tool cannot place orders.
+
+    Args:
+        legs: Option leg objects with ``option_type`` (call/put), positive
+            ``strike``, signed integer ``qty``, and optional per-share
+            ``premium``. Positive quantity is long; negative is short.
+        entry_spot: Positive underlying spot at entry.
+        expiry_days: Non-negative calendar days to expiry.
+        risk_free_rate: Annual continuously compounded risk-free rate.
+        volatility: Annualized entry volatility, e.g. 0.3 for 30%.
+        multiplier: Currency multiplier per option price unit.
+        commission_rate: Entry commission fraction, aligned with the options
+            backtest engine.
+        spot_min: Optional non-negative chart/scenario lower bound.
+        spot_max: Optional chart/scenario upper bound above ``spot_min``.
+        spot_points: Display-grid size from 21 through 501.
+        scenario_iv_values: Optional positive annualized IV scenarios. Omit for
+            50%, 75%, 100%, 125%, and 150% of entry volatility.
+    """
+    params: dict[str, Any] = {
+        "legs": legs,
+        "entry_spot": entry_spot,
+        "expiry_days": expiry_days,
+        "risk_free_rate": risk_free_rate,
+        "volatility": volatility,
+        "multiplier": multiplier,
+        "commission_rate": commission_rate,
+        "spot_points": spot_points,
+    }
+    if spot_min is not None:
+        params["spot_min"] = spot_min
+    if spot_max is not None:
+        params["spot_max"] = spot_max
+    if scenario_iv_values is not None:
+        params["scenario_iv_values"] = scenario_iv_values
+    registry = _get_registry()
+    return registry.execute("options_payoff", params)
 
 
 # ---------------------------------------------------------------------------
@@ -2161,11 +2219,23 @@ def main():
     parser.add_argument(
         "--enable-shell-tools",
         action="store_true",
-        help="Register the bash / background_run shell tools (arbitrary OS "
-        "command execution — RCE surface). OFF by default for every transport; "
-        "equivalent to setting VIBE_TRADING_ENABLE_SHELL_TOOLS=1.",
+        help="Register bash / background_run / cancel_background (OS process "
+        "control — RCE surface). OFF by default for every transport; equivalent "
+        "to setting VIBE_TRADING_ENABLE_SHELL_TOOLS=1.",
     )
     args = parser.parse_args()
+
+    # One-time move of pre-#904 code-relative state into the runtime root.
+    # A failed migration must never block the server.
+    try:
+        from src.config import migrate as _migrate
+
+        _migrate.migrate_legacy_state()
+    except Exception:  # pragma: no cover — best-effort
+        logging.getLogger(__name__).warning(
+            "Legacy state migration failed", exc_info=True
+        )
+
     _include_shell_tools = _resolve_include_shell_tools(args.enable_shell_tools)
     _registry = None
     _get_registry()  # pre-warm: avoids deadlock when first tools/call lazy-inits inside FastMCP worker thread
